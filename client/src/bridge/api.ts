@@ -1,0 +1,1118 @@
+// Typed bridge over the Tauri command surface (src-tauri/src/commands.rs).
+// Tauri converts camelCase JS arg keys to the snake_case Rust params automatically.
+
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { vaultMutated } from "./sync-hook";
+import type {
+  AccountInfo,
+  AuditEntry,
+  AuthMethod,
+  BiometricStatus,
+  BiometricUnlockOutcome,
+  KeysetWipe,
+  PresenceCheck,
+  BroadcastEvent,
+  ConnectionProfile,
+  Identity,
+  IdentityBinding,
+  BindingResolution,
+  PersonalAuth,
+  DbConsistencyReport,
+  DeviceInfo,
+  ExecEvent,
+  GroupTargetPlan,
+  HostImportReport,
+  InstanceInfo,
+  InstanceStatus,
+  InviteInfo,
+  KeyRotationLink,
+  JoinPreview,
+  SpaceInfo,
+  DirectoryEntry,
+  PendingAction,
+  AttestationInfo,
+  EscrowParamsInfo,
+  ItemInfo,
+  JumpHost,
+  ProxyConfig,
+  KnownHostInfo,
+  KnownHostsImport,
+  LocalPaneSpec,
+  LocalShellInfo,
+  MemberInfo,
+  MemberRole,
+  MultiExecResult,
+  MultiExecTarget,
+  OpenedBroadcast,
+  OpenedTunnel,
+  PairingPayload,
+  ProgressEvent,
+  PublicKeyInfo,
+  RemainingMember,
+  ServerGroup,
+  ServerList,
+  ServerStatus,
+  SftpEntry,
+  SftpFileStat,
+  LocalEntry,
+  LocalVolume,
+  SshExecResult,
+  ServerVault,
+  SyncReport,
+  MovedVault,
+  TermEvent,
+  VaultInfo,
+  VaultIntegrityReport,
+} from "./types";
+import { profileToAuth } from "./types";
+
+// After a vault-content mutation succeeds, notify the auto-sync hook so cloud
+// vaults push to their server immediately (no manual "Sync now"). The original
+// result is passed through unchanged.
+function afterMut<T>(vaultId: string, p: Promise<T>): Promise<T> {
+  return p.then((r) => {
+    vaultMutated(vaultId);
+    return r;
+  });
+}
+
+// ── account / instance ─────────────────────────────────────────
+export const instanceStatus = () => invoke<InstanceStatus>("instance_status");
+/** Device-local layout metadata, stored in SQLCipher and available only unlocked. */
+export const terminalWorkspaceLoad = () => invoke<[number, string | null]>("terminal_workspace_load");
+export const terminalWorkspaceSave = (epoch: number, document: string) =>
+  invoke<void>("terminal_workspace_save", { epoch, document });
+/** Clear a half-written (partial) instance so onboarding can start clean.
+ *  Backend hard-guards this to never touch a complete or unlocked instance. */
+export const resetPartialInstance = () => invoke<void>("reset_partial_instance");
+/** Destructive full reset of this device's instance (db + keyset + cloud links +
+ *  keychain Secret Key) → back to onboarding. Backend refuses while unlocked.
+ *  The "can't unlock → start over" escape on the lock screen. */
+export const resetInstance = () => invoke<void>("reset_instance");
+/** Absolute path to the per-OS application log directory. */
+export const logDir = () => invoke<string>("log_dir");
+/** Open the log directory in the OS file manager. */
+export const revealLogDir = () => invoke<void>("reveal_log_dir");
+/** Tell the native listener we are done with a `system-lock` suspend signal.
+ *  It is holding the machine awake — a logind delay inhibitor on Linux, its own
+ *  window proc on Windows — so this must be called for EVERY suspend signal,
+ *  including ones the user's settings say to ignore. `token` is the one the
+ *  event carried; it says WHICH suspend is being answered. */
+export const systemLockAck = (token: number) => invoke<void>("system_lock_ack", { token });
+/** True when a tiling window manager runs the session — the DEFAULT for whether
+ *  to draw our own title bar, overridable by the user. False everywhere but
+ *  Linux/BSD. */
+export const tilingSession = () => invoke<boolean>("tiling_session");
+export const createAccount = (password: string | null) =>
+  invoke<string>("create_account", { password });
+export const unlock = (password: string | null, secretKeyHex: string) =>
+  invoke<void>("unlock", { password, secretKeyHex });
+export const lock = () => invoke<void>("lock");
+export const isUnlocked = () => invoke<boolean>("is_unlocked");
+export const changePassword = (
+  oldPassword: string | null,
+  newPassword: string | null,
+  secretKeyHex: string,
+) => invoke<KeysetWipe>("change_password", { oldPassword, newPassword, secretKeyHex });
+export const accountId = () => invoke<string>("account_id");
+
+// ── vaults ─────────────────────────────────────────────────────
+export const listVaults = () => invoke<VaultInfo[]>("list_vaults");
+export const createVault = (vaultId: string, name: string) =>
+  afterMut(vaultId, invoke<void>("create_vault", { vaultId, name }));
+export const renameVault = (vaultId: string, newName: string) =>
+  afterMut(vaultId, invoke<void>("rename_vault", { vaultId, newName }));
+export const deleteVault = (vaultId: string) =>
+  afterMut(vaultId, invoke<void>("delete_vault", { vaultId }));
+export const verifyVaultIntegrity = (vaultId: string) =>
+  invoke<VaultIntegrityReport>("verify_vault_integrity", { vaultId });
+export const checkConsistency = () => invoke<DbConsistencyReport>("check_consistency");
+export const purgeVault = (vaultId: string) => invoke<void>("purge_vault", { vaultId });
+/** Write a vault out as a portable encrypted backup. The PATH goes in and the
+ *  file is written in the core — a backup carries every item, recordings
+ *  included, and a byte array crossing the IPC bridge becomes a JSON array of
+ *  numbers. Returns the size written. */
+export const vaultExportBackup = (vaultId: string, passphrase: string, path: string) =>
+  invoke<number>("vault_export_backup", { vaultId, passphrase, path });
+/** Read a backup into a NEW vault under `name`. Never overwrites an existing one.
+ *  The name is applied after the import because the bundle carries the name the
+ *  vault had — restoring beside the original would otherwise produce two entries
+ *  called the same thing. */
+export const vaultImportBackup = (
+  path: string,
+  passphrase: string,
+  newVaultId: string,
+  name: string,
+) => invoke<void>("vault_import_backup", { path, passphrase, newVaultId, name });
+
+// ── items / keys / certs ───────────────────────────────────────
+export const listItems = (vaultId: string) => invoke<ItemInfo[]>("list_items", { vaultId });
+export const generateSshKey = (vaultId: string, itemId: string) =>
+  afterMut(vaultId, invoke<string>("generate_ssh_key", { vaultId, itemId }));
+export const importSshKey = (
+  vaultId: string,
+  itemId: string,
+  opensshPrivate: string,
+  passphrase?: string,
+) =>
+  afterMut(
+    vaultId,
+    invoke<string>("import_ssh_key", {
+      vaultId,
+      itemId,
+      opensshPrivate,
+      passphrase: passphrase ?? null,
+    }),
+  );
+export const importSshCertificate = (vaultId: string, keyItemId: string, certOpenssh: string) =>
+  afterMut(vaultId, invoke<void>("import_ssh_certificate", { vaultId, keyItemId, certOpenssh }));
+export const getPublicKey = (vaultId: string, itemId: string) =>
+  invoke<PublicKeyInfo>("get_public_key", { vaultId, itemId });
+/** Export the private OpenSSH key (backup/migration). Gate behind explicit user intent. */
+export const exportSshKey = (vaultId: string, itemId: string) =>
+  invoke<string>("export_ssh_key", { vaultId, itemId });
+/** Rotate an SSH key in place (same item id). Returns the new public key to install. */
+export const rotateSshKey = (vaultId: string, itemId: string) =>
+  afterMut(vaultId, invoke<string>("rotate_ssh_key", { vaultId, itemId }));
+/** Staged rotation: generate a candidate key beside `keyId`. Returns its item id. */
+export const beginKeyRotation = (vaultId: string, keyId: string) =>
+  afterMut(vaultId, invoke<string>("begin_key_rotation", { vaultId, keyId }));
+/** Commit a staged rotation into `keyId` (old material stays in its history). */
+export const finishKeyRotation = (vaultId: string, keyId: string, candidateId: string) =>
+  afterMut(vaultId, invoke<void>("finish_key_rotation", { vaultId, keyId, candidateId }));
+/** Abandon a staged rotation: the candidate is deleted, the original untouched. */
+export const abandonKeyRotation = (vaultId: string, candidateId: string) =>
+  afterMut(vaultId, invoke<void>("abandon_key_rotation", { vaultId, candidateId }));
+/** Rotations in progress on this device (device-local links, live candidates only). */
+export const listKeyRotations = (vaultId: string) =>
+  invoke<KeyRotationLink[]>("list_key_rotations", { vaultId });
+export const renameItem = (vaultId: string, itemId: string, newItemId: string) =>
+  afterMut(vaultId, invoke<void>("rename_item", { vaultId, itemId, newItemId }));
+export const deleteItem = (vaultId: string, itemId: string) =>
+  afterMut(vaultId, invoke<void>("delete_item", { vaultId, itemId }));
+export const listItemVersions = (vaultId: string, itemId: string) =>
+  invoke<number[]>("list_item_versions", { vaultId, itemId });
+
+// ── passwords ──────────────────────────────────────────────────
+export const savePassword = (vaultId: string, itemId: string, password: string) =>
+  afterMut(vaultId, invoke<void>("save_password", { vaultId, itemId, password }));
+export const getPassword = (vaultId: string, itemId: string) =>
+  invoke<string>("get_password", { vaultId, itemId });
+export const getPasswordVersion = (vaultId: string, itemId: string, version: number) =>
+  invoke<string>("get_password_version", { vaultId, itemId, version });
+
+// ── notes ──────────────────────────────────────────────────────
+export const saveNote = (vaultId: string, itemId: string, text: string) =>
+  afterMut(vaultId, invoke<void>("save_note", { vaultId, itemId, text }));
+export const getNote = (vaultId: string, itemId: string) =>
+  invoke<string>("get_note", { vaultId, itemId });
+export const getNoteVersion = (vaultId: string, itemId: string, version: number) =>
+  invoke<string>("get_note_version", { vaultId, itemId, version });
+
+// ── known hosts / TOFU ─────────────────────────────────────────
+export const listKnownHosts = () => invoke<KnownHostInfo[]>("list_known_hosts");
+export const forgetHost = (host: string, port: number) =>
+  invoke<boolean>("forget_host", { host, port });
+export const trustHost = (host: string, port: number, expectedFingerprint: string) =>
+  invoke<string>("trust_host", { host, port, expectedFingerprint });
+export const importKnownHosts = (text: string) =>
+  invoke<KnownHostsImport>("import_known_hosts", { text });
+
+// ── connection profiles (hosts) ────────────────────────────────
+export const saveConnection = (vaultId: string, profile: ConnectionProfile) =>
+  afterMut(vaultId, invoke<void>("save_connection", { vaultId, profile }));
+export const listConnections = (vaultId: string) =>
+  invoke<ConnectionProfile[]>("list_connections", { vaultId });
+export const getConnection = (vaultId: string, profileId: string) =>
+  invoke<ConnectionProfile>("get_connection", { vaultId, profileId });
+export const deleteConnection = (vaultId: string, profileId: string) =>
+  afterMut(vaultId, invoke<void>("delete_connection", { vaultId, profileId }));
+
+// ── identities (personal SSH creds) ────────────────────────────
+export const saveIdentity = (vaultId: string, identity: Identity) =>
+  afterMut(vaultId, invoke<void>("save_identity", { vaultId, identity }));
+export const listIdentities = (vaultId: string) =>
+  invoke<Identity[]>("list_identities", { vaultId });
+export const getIdentity = (vaultId: string, identityId: string) =>
+  invoke<Identity>("get_identity", { vaultId, identityId });
+export const deleteIdentity = (vaultId: string, identityId: string) =>
+  afterMut(vaultId, invoke<void>("delete_identity", { vaultId, identityId }));
+
+// ── identity bindings (personal vault ↔ shared host) ───────────
+export const setBinding = (
+  personalVaultId: string,
+  binding: IdentityBinding,
+  allowRebind = false,
+) => afterMut(personalVaultId, invoke<void>("set_binding", { personalVaultId, binding, allowRebind }));
+export const getBinding = (personalVaultId: string, teamVaultId: string, profileUid: string) =>
+  invoke<IdentityBinding | null>("get_binding", { personalVaultId, teamVaultId, profileUid });
+export const listBindings = (personalVaultId: string) =>
+  invoke<IdentityBinding[]>("list_bindings", { personalVaultId });
+export const deleteBinding = (personalVaultId: string, teamVaultId: string, profileUid: string) =>
+  afterMut(
+    personalVaultId,
+    invoke<void>("delete_binding", { personalVaultId, teamVaultId, profileUid }),
+  );
+export const resolveHostBinding = (
+  personalVaultId: string,
+  teamVaultId: string,
+  profileUid: string,
+  currentDestination: string,
+) =>
+  invoke<BindingResolution>("resolve_host_binding", {
+    personalVaultId,
+    teamVaultId,
+    profileUid,
+    currentDestination,
+  });
+/** Resolve a Personal profile's connect auth in-core (binding → identity +
+ *  anti-redirect). Rejects if unbound or the destination changed since binding. */
+export const resolvePersonalAuth = (
+  teamVaultId: string,
+  profileUid: string,
+  currentDestination: string,
+  profileUserFallback: string,
+) =>
+  invoke<PersonalAuth>("resolve_personal_auth", {
+    teamVaultId,
+    profileUid,
+    currentDestination,
+    profileUserFallback,
+  });
+/** Canonical anti-redirect destination string (includes the username template).
+ *  Use for BOTH the bind pin and the connect `currentDestination` so they match. */
+export const personalDestination = (
+  host: string,
+  port: number,
+  usernameTemplate: string | null | undefined,
+  jumps: JumpHost[],
+  proxy?: ProxyConfig | null,
+) =>
+  invoke<string>("personal_destination", {
+    host,
+    port,
+    usernameTemplate: usernameTemplate ?? null,
+    // Anti-redirect pins the ProxyJump chain too — a mutated chain must change
+    // the destination so a bound personal credential isn't routed via a MITM hop.
+    // The outbound proxy is pinned for the same reason.
+    jumps,
+    proxy: proxy ?? null,
+  });
+/** Final connect username: applies the username template (`%u`→baseUser), else `baseUser`. */
+export const applyUsernameTemplate = (baseUser: string, usernameTemplate?: string | null) =>
+  invoke<string>("apply_username_template", { baseUser, usernameTemplate: usernameTemplate ?? null });
+
+/** Resolve a profile's connect {user, auth} for an INTERACTIVE connection.
+ *  Personal profiles are resolved in-core (binding → identity + anti-redirect,
+ *  rejecting on Unbound/Redirected) and get the resolved connect username;
+ *  everything else uses the stored ProfileAuth. `vaultId` is the profile's vault
+ *  (the team vault for a Personal host). Throws on a Personal resolution error —
+ *  callers surface it. Not for fan-out (Personal is excluded there — B6). */
+export async function resolveConnectAuth(
+  profile: ConnectionProfile,
+  vaultId: string,
+  promptedPassword?: string,
+): Promise<{ user: string; auth: AuthMethod }> {
+  if (profile.auth.type === "personal") {
+    const dest = await personalDestination(
+      profile.host,
+      profile.port,
+      profile.usernameTemplate,
+      profile.jumps,
+      profile.proxy,
+    );
+    const pa = await resolvePersonalAuth(vaultId, profile.uid, dest, profile.user);
+    const user = await applyUsernameTemplate(pa.user, profile.usernameTemplate);
+    return { user, auth: pa.auth };
+  }
+  return { user: profile.user, auth: profileToAuth(profile.auth, vaultId, promptedPassword) };
+}
+export interface SkippedDirective {
+  line: number;
+  keyword: string;
+  /** Inside a `Match` block, whose conditions depend on the connection being
+   *  made. The remedy differs from a plain unsupported directive: a Match block
+   *  has to be rewritten as a Host block. */
+  insideMatch: boolean;
+  /** The included file it was written in, null for the config that was picked.
+   *  A line number alone stops being actionable once an import spans files. */
+  originFile: string | null;
+}
+
+/** A host an import would create, resolved the way `ssh` resolves it. */
+export interface SshConfigHost {
+  alias: string;
+  /** The included file it came from, null for the config that was picked. */
+  originFile: string | null;
+  hostname: string;
+  port: number;
+  user: string | null;
+  /** `IdentityFile` as written; the client resolves and reads it. */
+  identityFile: string | null;
+}
+
+export interface SshConfigReport {
+  hosts: SshConfigHost[];
+  skipped: SkippedDirective[];
+  /** `Include`s seen but not followed — all of them for a report on pasted
+   *  text, and the unreadable ones for a report on a file. */
+  pendingIncludes: PendingInclude[];
+  /** Every file the report read, the picked one first; empty for text. */
+  filesRead: SshConfigFile[];
+}
+
+/** An `Include` a report saw but did not follow. */
+export interface PendingInclude {
+  path: string;
+  /** The file the `Include` line sits in; null for the config that was picked.
+   *  Two files can each say `Include local` — without this the report names the
+   *  same string twice and neither is a place to go and fix. */
+  originFile: string | null;
+}
+
+/** A file a report read, and the file whose `Include` pulled it in. */
+export interface SshConfigFile {
+  path: string;
+  /** null for the config that was picked. An importer walks this up to the file
+   *  the picked config included directly — one level of grouping, however deep
+   *  the includes go. */
+  includedBy: string | null;
+}
+
+/** A host an import created. */
+export interface ImportedSshHost {
+  alias: string;
+  originFile: string | null;
+}
+
+/** What an import would drop. Parses only — writes nothing. Includes are
+ *  reported, not followed: text has no filesystem behind it. */
+export const sshConfigReport = (configText: string) =>
+  invoke<SshConfigReport>("ssh_config_report", { configText });
+
+/** The same for a config **file**, whose `Include` directives are followed the
+ *  way `ssh` follows them. Reads more than the file it was given, and says so in
+ *  `filesRead` — which is why nothing may be imported without showing it. */
+export const sshConfigReportAtPath = (path: string) =>
+  invoke<SshConfigReport>("ssh_config_report_at_path", { path });
+
+export const importSshConfig = (vaultId: string, configText: string) =>
+  afterMut(vaultId, invoke<string[]>("import_ssh_config", { vaultId, configText }));
+
+/** Imports a config file, following its includes. `only` is the set of aliases
+ *  to import — what the preview left ticked; omit it to import every host. */
+export const importSshConfigAtPath = (vaultId: string, path: string, only?: string[]) =>
+  afterMut(
+    vaultId,
+    invoke<ImportedSshHost[]>("import_ssh_config_at_path", { vaultId, path, only }),
+  );
+export const exportSshConfig = (vaultId: string) =>
+  invoke<string>("export_ssh_config", { vaultId });
+export const importPuttySessions = (vaultId: string, regText: string) =>
+  afterMut(vaultId, invoke<HostImportReport>("import_putty_sessions", { vaultId, regText }));
+
+// ── groups ─────────────────────────────────────────────────────
+export interface SystemAgentKey {
+  /** OpenSSH public-key line — the handle that selects this identity. */
+  publicKey: string;
+  /** The agent's comment: usually a filename or a token label. */
+  comment: string;
+  /** e.g. `sk-ssh-ed25519@openssh.com` for a FIDO token. */
+  algorithm: string;
+}
+
+/** What the OS ssh-agent currently holds. Needs no unlock — this reads the
+ *  agent, not the vault. */
+export const systemAgentKeys = () => invoke<SystemAgentKey[]>("system_agent_keys");
+
+export interface Snippet {
+  snippetId: string;
+  label: string;
+  command: string;
+  tags: string[];
+}
+
+export const saveSnippet = (vaultId: string, snippet: Snippet) =>
+  afterMut(vaultId, invoke<void>("save_snippet", { vaultId, snippet }));
+export const listSnippets = (vaultId: string) =>
+  invoke<Snippet[]>("list_snippets", { vaultId });
+export const deleteSnippet = (vaultId: string, snippetId: string) =>
+  afterMut(vaultId, invoke<void>("delete_snippet", { vaultId, snippetId }));
+
+export const saveGroup = (vaultId: string, group: ServerGroup) =>
+  afterMut(vaultId, invoke<void>("save_group", { vaultId, group }));
+export const listGroups = (vaultId: string) => invoke<ServerGroup[]>("list_groups", { vaultId });
+export const getGroup = (vaultId: string, groupId: string) =>
+  invoke<ServerGroup>("get_group", { vaultId, groupId });
+export const deleteGroup = (vaultId: string, groupId: string) =>
+  afterMut(vaultId, invoke<void>("delete_group", { vaultId, groupId }));
+export const dryRunGroup = (vaultId: string, groupId: string) =>
+  invoke<GroupTargetPlan[]>("dry_run_group", { vaultId, groupId });
+
+// ── exec / fleet ───────────────────────────────────────────────
+// The vault a credential lives in now rides inside `auth` (and each jump's auth),
+// so there is no standalone `vaultId` here — target and hops may span vaults.
+export interface ConnectArgs {
+  host: string;
+  port: number;
+  user: string;
+  auth: AuthMethod;
+  jumps: JumpHost[];
+  /** Outbound http/socks4/socks5 proxy for the first TCP hop (issue #27). */
+  proxy?: ProxyConfig | null;
+}
+export const sshExec = (a: ConnectArgs, command: string) =>
+  invoke<SshExecResult>("ssh_exec", { ...a, command });
+export const sshExecMulti = (
+  targets: MultiExecTarget[],
+  command: string,
+  maxConcurrency: number,
+  timeoutSecs: number,
+) => invoke<MultiExecResult[]>("ssh_exec_multi", { targets, command, maxConcurrency, timeoutSecs });
+export const sshExecByTags = (
+  vaultId: string,
+  tags: string[],
+  matchAll: boolean,
+  command: string,
+  maxConcurrency: number,
+  timeoutSecs: number,
+) =>
+  invoke<MultiExecResult[]>("ssh_exec_by_tags", {
+    vaultId,
+    tags,
+    matchAll,
+    command,
+    maxConcurrency,
+    timeoutSecs,
+  });
+export const sshExecGroup = (
+  vaultId: string,
+  groupId: string,
+  command: string,
+  maxConcurrency: number,
+  timeoutSecs: number,
+) =>
+  invoke<MultiExecResult[]>("ssh_exec_group", {
+    vaultId,
+    groupId,
+    command,
+    maxConcurrency,
+    timeoutSecs,
+  });
+
+// ── streaming exec ─────────────────────────────────────────────
+export async function execStreamOpen(
+  a: ConnectArgs,
+  command: string,
+  onEvent: (e: ExecEvent) => void,
+): Promise<string> {
+  const ch = new Channel<ExecEvent>();
+  ch.onmessage = onEvent;
+  return invoke<string>("exec_stream_open", { ...a, command, onEvent: ch });
+}
+export const execStreamWrite = (id: string, data: number[]) =>
+  invoke<void>("exec_stream_write", { id, data });
+export const execStreamClose = (id: string) => invoke<void>("exec_stream_close", { id });
+
+// ── interactive PTY sessions ───────────────────────────────────
+export interface OpenSessionArgs extends ConnectArgs {
+  term: string;
+  cols: number;
+  rows: number;
+}
+/** Ask the core to record this session into `vaultId` under `recordingId`.
+ *  The document is written when the session ends, not while it runs. */
+export interface RecordingRequest {
+  vaultId: string;
+  recordingId: string;
+  label: string;
+}
+
+export interface RecordingMeta {
+  mcp?: { command?: string | null; application: string; outcome: string; exitCode: number | null } | null;
+  recordingId: string;
+  label: string;
+  host: string;
+  user: string;
+  startedUnix: number;
+  durationSecs: number;
+  /** The size cap stopped the capture before the session ended. */
+  truncated: boolean;
+  sizeBytes: number;
+}
+
+export const listRecordings = (vaultId: string) =>
+  invoke<RecordingMeta[]>("list_recordings", { vaultId });
+/** The asciicast v2 document — playable by `asciinema`, not only by us. */
+export const getRecording = (vaultId: string, recordingId: string) =>
+  invoke<string>("get_recording", { vaultId, recordingId });
+export const deleteRecording = (vaultId: string, recordingId: string) =>
+  afterMut(vaultId, invoke<void>("delete_recording", { vaultId, recordingId }));
+
+export async function sessionOpen(
+  a: OpenSessionArgs,
+  onEvent: (e: TermEvent) => void,
+  recording?: RecordingRequest,
+  agentForward = false,
+): Promise<string> {
+  const ch = new Channel<TermEvent>();
+  ch.onmessage = onEvent;
+  return invoke<string>("session_open", {
+    ...a,
+    onEvent: ch,
+    recording: recording ?? null,
+    agentForward,
+  });
+}
+export async function sessionOpenReconnecting(
+  a: OpenSessionArgs & { maxRetries: number; backoffMs: number },
+  onEvent: (e: TermEvent) => void,
+  agentForward = false,
+): Promise<string> {
+  const ch = new Channel<TermEvent>();
+  ch.onmessage = onEvent;
+  return invoke<string>("session_open_reconnecting", { ...a, onEvent: ch, agentForward });
+}
+/** Open a shell on this machine. Shares the session id space with SSH panes, so
+ *  sessionWrite/sessionResize/sessionClose drive it unchanged. */
+export async function localSessionOpen(
+  spec: LocalPaneSpec,
+  cols: number,
+  rows: number,
+  onEvent: (e: TermEvent) => void,
+  recording?: RecordingRequest,
+): Promise<string> {
+  const ch = new Channel<TermEvent>();
+  ch.onmessage = onEvent;
+  return invoke<string>("local_session_open", {
+    spec: { program: spec.shell, args: spec.args, cwd: spec.cwd ?? null },
+    cols,
+    rows,
+    onEvent: ch,
+    recording: recording ?? null,
+  });
+}
+/** The default shell for this machine (also the Settings placeholder). */
+export const localShellDefault = () => invoke<LocalShellInfo>("local_shell_default");
+/** Split an argument string shell-style; null when it doesn't parse. */
+export const localShellSplitArgs = (text: string) =>
+  invoke<string[] | null>("local_shell_split_args", { text });
+
+export const sessionWrite = (id: string, data: number[]) =>
+  invoke<void>("session_write", { id, data });
+export const sessionResize = (id: string, cols: number, rows: number) =>
+  invoke<void>("session_resize", { id, cols, rows });
+export const sessionClose = (id: string) => invoke<void>("session_close", { id });
+
+/** Set the SSH keepalive interval (seconds) for subsequent connections; 0 = off. */
+export const setKeepaliveSecs = (secs: number) =>
+  invoke<void>("set_keepalive_secs", { secs });
+
+/** Restrict what new SSH connections may negotiate. `true` = modern only:
+ *  post-quantum key exchange required, Ed25519 host keys, AEAD ciphers. */
+export const setAlgorithmPolicy = (modern: boolean) =>
+  invoke<void>("set_algorithm_policy", { modern });
+
+// ── broadcast ──────────────────────────────────────────────────
+export async function broadcastOpen(
+  targets: MultiExecTarget[],
+  term: string,
+  cols: number,
+  rows: number,
+  onEvent: (e: BroadcastEvent) => void,
+): Promise<OpenedBroadcast> {
+  const ch = new Channel<BroadcastEvent>();
+  ch.onmessage = onEvent;
+  return invoke<OpenedBroadcast>("broadcast_open", { targets, term, cols, rows, onEvent: ch });
+}
+export const broadcastWriteAll = (id: string, data: number[]) =>
+  invoke<void>("broadcast_write_all", { id, data });
+export const broadcastResizeAll = (id: string, cols: number, rows: number) =>
+  invoke<void>("broadcast_resize_all", { id, cols, rows });
+export const broadcastClose = (id: string) => invoke<void>("broadcast_close", { id });
+
+// ── tunnels ────────────────────────────────────────────────────
+export const tunnelOpenLocal = (
+  a: ConnectArgs,
+  localBind: string,
+  remoteHost: string,
+  remotePort: number,
+) => invoke<OpenedTunnel>("tunnel_open_local", { ...a, localBind, remoteHost, remotePort });
+export const tunnelOpenDynamic = (a: ConnectArgs, localBind: string) =>
+  invoke<OpenedTunnel>("tunnel_open_dynamic", { ...a, localBind });
+export const tunnelOpenRemote = (
+  a: ConnectArgs,
+  remoteBind: string,
+  remotePort: number,
+  localHost: string,
+  localPort: number,
+) =>
+  invoke<OpenedTunnel>("tunnel_open_remote", {
+    ...a,
+    remoteBind,
+    remotePort,
+    localHost,
+    localPort,
+  });
+export const tunnelClose = (id: string) => invoke<void>("tunnel_close", { id });
+
+// ── SFTP ───────────────────────────────────────────────────────
+export const sftpFingerprint = (id: string, path: string) => invoke<number[]>("sftp_fingerprint", { id, path });
+export const sftpInvalidate = () => invoke<void>("sftp_invalidate");
+export const sftpCommit = (id: string, from: string, to: string, replace: boolean, cancelId?: string) => invoke<void>("sftp_commit", { id, cancelId, from, to, replace });
+export const localCreatePrivate = (path: string) => invoke<void>("local_create_private", { path });
+export const localCopyPrepared = (from: string, to: string) => invoke<number>("local_copy_prepared", { from, to });
+export const localCommit = (from: string, to: string, replace: boolean) => invoke<void>("local_commit", { from, to, replace });
+export const localSameFile = (from: string, to: string) => invoke<boolean>("local_same_file", { from, to });
+export const localRealpath = (path: string) => invoke<string>("local_realpath", { path });
+export const localReadText = (path: string, limit = 2 * 1024 * 1024) => invoke<string>("local_read_text", { path, limit });
+export const localSetMetadata = (path: string, mode?: number, mtime?: number) => invoke<void>("local_set_metadata", { path, mode, mtime });
+export const sftpSetMetadata = (id: string, path: string, mode?: number, mtime?: number, cancelId?: string) => invoke<void>("sftp_set_metadata", { id, cancelId, path, mode, mtime });
+export const sftpListDirCancel = (id: string, path: string, cancelId: string) => invoke<SftpEntry[]>("sftp_list_dir_cancel", { id, path, cancelId });
+export const sftpRelay = (id: string, targetId: string, remote: string, destination: string, onProgress: (p: ProgressEvent) => void, cancelId: string) => {
+  const channel = new Channel<ProgressEvent>(); channel.onmessage = onProgress;
+  return invoke<boolean>("sftp_relay", { id, targetId, remote, destination, onProgress: channel, cancelId });
+};
+export const sftpOpen = (a: ConnectArgs, parallelism: number) =>
+  invoke<string>("sftp_open", { ...a, parallelism });
+export const sftpListDir = (id: string, path: string) =>
+  invoke<SftpEntry[]>("sftp_list_dir", { id, path });
+export const localListDir = (path: string, cancelId?: string) => invoke<LocalEntry[]>("local_list_dir", { path, cancelId });
+export const localLstat = (path: string) => invoke<LocalEntry | null>("local_lstat", { path });
+export const localReadlink = (path: string) => invoke<string>("local_readlink", { path });
+export const localSymlink = (target: string, path: string, targetIsDir: boolean) =>
+  invoke<void>("local_symlink", { target, path, targetIsDir });
+export const localUnlink = (path: string) => invoke<void>("local_unlink", { path });
+export const sftpLstat = (id: string, path: string, cancelId?: string) => invoke<SftpFileStat>("sftp_lstat", { id, cancelId, path });
+export const sftpReadlink = (id: string, path: string, cancelId?: string) => invoke<string>("sftp_readlink", { id, cancelId, path });
+export const sftpSymlink = (id: string, target: string, path: string, cancelId?: string) =>
+  invoke<void>("sftp_symlink", { id, cancelId, target, path });
+/** Mounted volumes (drives) — empty on mobile, where there is nothing to pick. */
+export const localVolumes = () => invoke<LocalVolume[]>("local_volumes");
+export const sftpStat = (id: string, path: string, cancelId?: string) =>
+  invoke<SftpFileStat>("sftp_stat", { id, cancelId, path });
+export const sftpRealpath = (id: string, path: string) =>
+  invoke<string>("sftp_realpath", { id, path });
+export const sftpReopen = (id: string) => invoke<void>("sftp_reopen", { id });
+export const sftpMkdir = (id: string, path: string, cancelId?: string) => invoke<void>("sftp_mkdir", { id, cancelId, path });
+export const sftpCreateNewFile = (id: string, path: string, cancelId?: string) =>
+  invoke<void>("sftp_create_new_file", { id, cancelId, path });
+export const sftpRmdir = (id: string, path: string) => invoke<void>("sftp_rmdir", { id, path });
+export const sftpRmdirRecursive = (id: string, path: string) =>
+  invoke<void>("sftp_rmdir_recursive", { id, path });
+export const sftpRemove = (id: string, path: string) => invoke<void>("sftp_remove", { id, path });
+export const sftpRename = (id: string, from: string, to: string) =>
+  invoke<void>("sftp_rename", { id, from, to });
+export const sftpChmod = (id: string, path: string, mode: number) =>
+  invoke<void>("sftp_chmod", { id, path, mode });
+export const sftpReadFile = (id: string, path: string) =>
+  invoke<ArrayBuffer>("sftp_read_file", { id, path });
+export const sftpWriteFile = (id: string, path: string, data: number[]) =>
+  invoke<void>("sftp_write_file", { id, path, data });
+export async function sftpDownload(
+  id: string,
+  remotePath: string,
+  localPath: string,
+  offset: number,
+  knownSize: number | null,
+  onProgress: (p: ProgressEvent) => void,
+  cancelId?: string,
+): Promise<boolean> {
+  const ch = new Channel<ProgressEvent>();
+  ch.onmessage = onProgress;
+  return invoke<boolean>("sftp_download", {
+    id,
+    remotePath,
+    localPath,
+    offset,
+    knownSize,
+    onProgress: ch,
+    cancelId,
+  });
+}
+export async function sftpUpload(
+  id: string,
+  localPath: string,
+  remotePath: string,
+  offset: number,
+  onProgress: (p: ProgressEvent) => void,
+  cancelId?: string,
+): Promise<boolean> {
+  const ch = new Channel<ProgressEvent>();
+  ch.onmessage = onProgress;
+  return invoke<boolean>("sftp_upload", {
+    id,
+    localPath,
+    remotePath,
+    offset,
+    onProgress: ch,
+    cancelId,
+  });
+}
+export const sftpClose = (id: string) => invoke<void>("sftp_close", { id });
+
+// ── cancel tokens ──────────────────────────────────────────────
+export const cancelNew = () => invoke<string>("cancel_new");
+export const cancelTrigger = (id: string) => invoke<void>("cancel_trigger", { id });
+export const cancelDispose = (id: string) => invoke<void>("cancel_dispose", { id });
+
+// ── OS keychain (Secret Key on a trusted device) ───────────────
+export const keychainAvailable = () => invoke<boolean>("keychain_available");
+export const keychainSaveSecretKey = (secretKey: string) =>
+  invoke<void>("keychain_save_secret_key", { secretKey });
+export const keychainGetSecretKey = () => invoke<string | null>("keychain_get_secret_key");
+/** Trusted-device auto-unlock done in Rust: the Secret Key never enters JS. */
+export const keychainUnlock = (password: string | null) =>
+  invoke<void>("keychain_unlock", { password });
+export const keychainDeleteSecretKey = () => invoke<void>("keychain_delete_secret_key");
+
+// ── biometric unlock (Touch ID on macOS, Windows Hello on Windows) ──
+// The password goes IN once, when enabling (from the form that already holds
+// it). It never comes back out: the biometric unlock reads, unseals and uses it
+// entirely in Rust.
+/** `withSecretKey`: also say whether the Secret Key is remembered when nothing
+ *  is stored (Settings, the presence gate). Without it the password unlock
+ *  screen never waits on a keychain read it does not need. */
+export const biometricStatus = (withSecretKey: boolean) =>
+  invoke<BiometricStatus>("biometric_status", { withSecretKey });
+export const biometricEnable = (password: string) => invoke<void>("biometric_enable", { password });
+export const biometricDisable = () => invoke<void>("biometric_disable");
+/** `reason` is the localised line the system prompt shows under the app name. */
+export const biometricUnlock = (reason: string) =>
+  invoke<BiometricUnlockOutcome>("biometric_unlock", { reason });
+/** The Secret-Key-only startup gate: the presence prompt, then the remembered-
+ *  key unlock, both in Rust. Nothing is stored behind the prompt. */
+export const biometricPresenceUnlock = (reason: string) =>
+  invoke<BiometricUnlockOutcome>("biometric_presence_unlock", { reason });
+/** Show the presence prompt once, before the startup gate is turned on.
+ *  Unlocks and stores nothing. */
+export const biometricConfirmPresence = (reason: string) =>
+  invoke<PresenceCheck>("biometric_confirm_presence", { reason });
+
+// ── cloud server: identity / session ───────────────────────────
+// The cloud integration is additive: a local-only instance never touches it.
+// An instance may be linked to MULTIPLE servers; per-server commands take an
+// optional `serverId` and default to the active server when it's omitted.
+export const serverStatus = (serverId?: string) =>
+  invoke<ServerStatus>("server_status", { serverId: serverId ?? null });
+/** Session-less probe of a server instance at `baseUrl`: its name, whether it has
+ *  been claimed, its instance id, and advertised sign-in methods. Drives the
+ *  Add-server flow's branch (setup-code vs invite/sign-in). PUBLIC — no session. */
+export const instanceInfo = (baseUrl: string) =>
+  invoke<InstanceInfo>("server_instance_info", { baseUrl });
+export const serverList = () => invoke<ServerList>("server_list");
+export const serverSetActive = (serverId: string) =>
+  invoke<ServerList>("server_set_active", { serverId });
+export const serverRemove = (serverId: string) =>
+  invoke<ServerList>("server_remove", { serverId });
+/** Join an instance via a single-link invite `inviteToken`. The instance is
+ *  addressed by `baseUrl` (no tenant id on the wire any more); the granted spaces
+ *  come back inside the resulting ServerStatus' link. Joiners are never owners. */
+export const serverJoin = (
+  baseUrl: string,
+  inviteToken: string,
+  opts: { displayName?: string; handle?: string } = {},
+) =>
+  invoke<ServerStatus>("server_join", {
+    baseUrl,
+    inviteToken,
+    displayName: opts.displayName ?? null,
+    handle: opts.handle ?? null,
+  });
+/** Claim an UNCLAIMED instance and become its owner. The `setupCode` (printed by
+ *  the server on first boot) authorizes the single-winner claim; the server creates
+ *  the owner account + device + a first Space and returns their ids. A claimed
+ *  instance returns 409. */
+export const serverClaim = (
+  baseUrl: string,
+  opts: { setupCode: string; displayName?: string; handle?: string; spaceName?: string },
+) =>
+  invoke<ServerStatus>("server_claim", {
+    baseUrl,
+    setupCode: opts.setupCode,
+    spaceName: opts.spaceName ?? null,
+    handle: opts.handle ?? null,
+    displayName: opts.displayName ?? null,
+  });
+export const serverLogin = (serverId?: string) =>
+  invoke<ServerStatus>("server_login", { serverId: serverId ?? null });
+/** Sign in with SSO (OIDC browser flow). Opens the system browser to the instance's
+ *  IdP, catches the loopback redirect, exchanges the code for an id_token, and runs
+ *  `POST /v1/oidc/callback` (nonce-bound to the local keyset). Gated on the probed
+ *  `instanceInfo().auth.includes("oidc")`. Requires the local keyset to be unlocked.
+ *  NOTE: the browser↔IdP round-trip needs a real IdP + browser (manual test). */
+export const serverOidcLogin = (baseUrl: string) =>
+  invoke<ServerStatus>("server_oidc_login", { baseUrl });
+export const serverRefreshSession = (serverId?: string) =>
+  invoke<ServerStatus>("server_refresh_session", { serverId: serverId ?? null });
+export const serverLogout = (serverId?: string) =>
+  invoke<ServerStatus>("server_logout", { serverId: serverId ?? null });
+export const serverDisconnect = (serverId?: string) =>
+  invoke<ServerList>("server_disconnect", { serverId: serverId ?? null });
+/** Preview an invite before joining (does not consume it): the instance name and
+ *  the spaces (with roles) it grants. Stateless — no session. */
+export const serverJoinPreview = (baseUrl: string, token: string) =>
+  invoke<JoinPreview>("server_join_preview", { baseUrl, token });
+export const serverDeviceAdd = (serverId?: string) =>
+  invoke<string>("server_device_add", { serverId: serverId ?? null });
+export const serverListDevices = (serverId?: string) =>
+  invoke<DeviceInfo[]>("server_list_devices", { serverId: serverId ?? null });
+export const serverDeviceRevoke = (deviceId: string, serverId?: string) =>
+  invoke<void>("server_device_revoke", { deviceId, serverId: serverId ?? null });
+export const serverAccountProfile = (
+  displayName: string | null,
+  handle: string | null,
+  serverId?: string,
+) =>
+  invoke<ServerStatus>("server_account_profile", {
+    displayName,
+    handle,
+    serverId: serverId ?? null,
+  });
+
+// ── cloud vaults + sync ────────────────────────────────────────
+// Bound 1:1 to a server (defaults to the active one) by a space id. `spaceId` picks
+// the bound space (an existing space you admin, or one just created); omit it to bind
+// to the link's primary space.
+export const serverCreateCloudVault = (name: string, serverId?: string, spaceId?: string) =>
+  invoke<string>("server_create_cloud_vault", {
+    serverId: serverId ?? null,
+    name,
+    spaceId: spaceId ?? null,
+  });
+// One-time migration: bind legacy unbound cloud vaults to a server (default active).
+export const serverBindUnboundCloudVaults = (serverId?: string) =>
+  invoke<number>("server_bind_unbound_cloud_vaults", { serverId: serverId ?? null });
+// Bind ONE cloud vault (hex id) to a server (default active). Reclaims an
+// orphaned/never-bound vault, OR moves an already-bound vault to a different
+// server (the label is overwritten; the vault re-pushes to the new server).
+export const serverBindCloudVault = (vaultId: string, serverId?: string) =>
+  invoke<void>("server_bind_cloud_vault", { vaultId, serverId: serverId ?? null });
+// Unbind ONE cloud vault (hex id) from its server — stops it syncing. The vault +
+// its data stay on this device; any server-side copy is left as-is.
+export const serverUnbindCloudVault = (vaultId: string) =>
+  invoke<boolean>("server_unbind_cloud_vault", { vaultId });
+export const serverSyncNow = (serverId?: string) =>
+  invoke<SyncReport>("server_sync_now", { serverId: serverId ?? null });
+/** Full re-pull: reset the pull cursor then sync — recovers vaults that an
+ *  incremental sync can't (rejected under a prior identity, cursor already past them). */
+export const serverRepull = (serverId?: string) =>
+  invoke<SyncReport>("server_repull", { serverId: serverId ?? null });
+/** Restore cloud vaults deleted LOCALLY but still live on the server (purge the
+ *  local tombstone that shadows the server copy, then re-pull). Returns the count. */
+export const serverRestoreDeletedVaults = (serverId?: string) =>
+  invoke<number>("server_restore_deleted_vaults", { serverId: serverId ?? null });
+/** List vaults available on a server (default active) that this account can access,
+ *  each enriched with local state (isLocal / bound / localName). */
+export const serverListVaults = (serverId?: string) =>
+  invoke<ServerVault[]>("server_list_vaults", { serverId: serverId ?? null });
+/** Pull ONE vault (hex id) from a server onto this device (targeted; no cursor bump). */
+export const serverPullVault = (vaultId: string, serverId?: string) =>
+  invoke<SyncReport>("server_pull_vault", { vaultId, serverId: serverId ?? null });
+/** Bind an already-cloud vault (hex id) to a server, then sync it up (Push). */
+export const serverBindAndPushVault = (vaultId: string, serverId?: string) =>
+  invoke<SyncReport>("server_bind_and_push_vault", { vaultId, serverId: serverId ?? null });
+
+/** Move a LOCAL vault to a server (default active) into `spaceId` (omit for the
+ *  link's primary space): the core re-keys it into a new cloud vault in one
+ *  transaction, then the first push runs. Resolves with the new vault id; a failed
+ *  push comes back in `pushError` and does not undo the move. */
+export const serverMoveVaultToServer = (vaultId: string, serverId?: string, spaceId?: string) =>
+  invoke<MovedVault>("server_move_vault_to_server", {
+    vaultId,
+    serverId: serverId ?? null,
+    spaceId: spaceId ?? null,
+  });
+
+// ── cloud membership / sharing ─────────────────────────────────
+export const serverListAccounts = (serverId?: string) =>
+  invoke<AccountInfo[]>("server_list_accounts", { serverId: serverId ?? null });
+export const serverAddMember = (
+  vaultId: string,
+  memberEd25519Hex: string,
+  memberX25519Hex: string,
+  role: MemberRole,
+) => invoke<void>("server_add_member", { vaultId, memberEd25519Hex, memberX25519Hex, role });
+export const serverListMembers = (vaultId: string) =>
+  invoke<MemberInfo[]>("server_list_members", { vaultId });
+export const serverMemberFingerprint = (ed25519PubHex: string) =>
+  invoke<string>("server_member_fingerprint", { ed25519PubHex });
+export const serverConfirmMemberPin = (accountId: string, ed25519PubHex: string) =>
+  invoke<void>("server_confirm_member_pin", { accountId, ed25519PubHex });
+export const serverPinVaultGenesisOwner = (vaultId: string, ed25519PubHex: string) =>
+  invoke<void>("server_pin_vault_genesis_owner", { vaultId, ed25519PubHex });
+export const setPersonalVault = (vaultId: string) =>
+  invoke<void>("set_personal_vault", { vaultId });
+export const setAccountDefaultUsername = (username: string) =>
+  invoke<void>("set_account_default_username", { username });
+export const getPersonalVault = () => invoke<string | null>("get_personal_vault");
+export const getAccountDefaultUsername = () =>
+  invoke<string | null>("get_account_default_username");
+export const serverRotateVk = (vaultId: string, remaining: RemainingMember[]) =>
+  invoke<number>("server_rotate_vk", { vaultId, remaining });
+
+// ── cloud spaces / directory / pending / attestations (server-v2) ──
+// Each command resolves its Bearer from the server link (defaults to the active
+// server), like the sibling identity commands — so they take an optional serverId.
+/** Mint a one-link invite for a SINGLE space intent (`spaceId` at `role`) on a
+ *  server (defaults to active). Caller must be an admin of that space. `ttlSeconds`
+ *  optionally bounds the invite lifetime. The token is shown once (only its hash is
+ *  stored server-side). */
+export const serverInvite = (
+  spaceId: string,
+  role: string,
+  ttlSeconds?: number,
+  serverId?: string,
+) =>
+  invoke<InviteInfo>("server_invite", {
+    spaceId,
+    role,
+    ttlSeconds: ttlSeconds ?? null,
+    serverId: serverId ?? null,
+  });
+/** The caller's own spaces (with roles) on a server (defaults to active). */
+export const serverListSpaces = (serverId?: string) =>
+  invoke<SpaceInfo[]>("server_list_spaces", { serverId: serverId ?? null });
+/** Create a Space (instance owner) on a server (defaults to active); the creator
+ *  becomes its admin. Returns the new space id (base64). */
+export const serverCreateSpace = (name: string, serverId?: string) =>
+  invoke<string>("server_create_space", { name, serverId: serverId ?? null });
+/** Add (idempotent) an account to a space at a role (space-admin) on a server
+ *  (defaults to active). */
+export const serverAddSpaceMember = (
+  spaceId: string,
+  accountId: string,
+  role: string,
+  serverId?: string,
+) =>
+  invoke<void>("server_add_space_member", {
+    spaceId,
+    accountId,
+    role,
+    serverId: serverId ?? null,
+  });
+/** The shared people directory on a server (defaults to active): handles + hex
+ *  canonical keys, ready to feed serverAddMember / serverAddSpaceMember. */
+export const serverDirectory = (serverId?: string) =>
+  invoke<DirectoryEntry[]>("server_directory", { serverId: serverId ?? null });
+/** The caller's outstanding vault-admin crypto actions (grant/revoke) on a server
+ *  (defaults to active). Fulfil each via serverAddMember / serverRotateVk. */
+export const serverPending = (serverId?: string) =>
+  invoke<PendingAction[]>("server_pending", { serverId: serverId ?? null });
+/** Publish an OPAQUE key-binding attestation about an account (space-admin) on a
+ *  server (defaults to active). `blob`/`signature` are base64, produced+verified by
+ *  clients (the server stores them verbatim). */
+export const serverAttestationsPut = (
+  accountId: string,
+  blob: string,
+  signature: string,
+  serverId?: string,
+) =>
+  invoke<void>("server_attestations_put", {
+    accountId,
+    blob,
+    signature,
+    serverId: serverId ?? null,
+  });
+/** Every attestation about an account on a server (defaults to active). Opaque
+ *  blob+signature (base64); the caller verifies signatures. */
+export const serverAttestationsList = (accountId: string, serverId?: string) =>
+  invoke<AttestationInfo[]>("server_attestations_list", {
+    accountId,
+    serverId: serverId ?? null,
+  });
+
+// ── cloud devices / onboarding ─────────────────────────────────
+/** Escrow this device's (already-encrypted) keyset to a server (defaults to active)
+ *  AND arm keyless-escrow sign-in: the escrow K_auth is derived ONCE from the SAME
+ *  `password` + `secretKeyHex` that wraps the uploaded blob, so a later
+ *  serverEscrowFetchAndUnlock re-derives an identical K_auth. `password` is null for
+ *  passwordless/SSO accounts. Returns the stored generation. */
+export const serverKeysetPush = (
+  password: string | null,
+  secretKeyHex: string,
+  serverId?: string,
+) =>
+  invoke<number>("server_keyset_push", {
+    password,
+    secretKeyHex,
+    serverId: serverId ?? null,
+  });
+export const serverKeysetPullAndUnlock = (
+  password: string | null,
+  secretKeyHex: string,
+  serverId?: string,
+) =>
+  invoke<void>("server_keyset_pull_and_unlock", {
+    password,
+    secretKeyHex,
+    serverId: serverId ?? null,
+  });
+/** Fetch the escrow Argon2id params for a `handle` from a server (PUBLIC — no
+ *  session). NOTE: a 200 is NOT proof the handle exists (shaped decoy for unknown
+ *  handles), so callers must not treat this as an existence oracle. */
+export const serverEscrowParams = (baseUrl: string, handle: string) =>
+  invoke<EscrowParamsInfo>("server_escrow_params", { baseUrl, handle });
+/** Sign in with an existing identity via a server's ESCROW (PUBLIC — no session): by
+ *  handle, recover + unlock the keyset, self-enroll THIS device, authenticate, and
+ *  persist the link. `password` is null for passwordless/SSO accounts; `secretKeyHex`
+ *  is the account Secret Key (Emergency Kit). A wrong password/key surfaces as the
+ *  server's 403. Returns the resulting linked-server status (mirrors claim/join). */
+export const serverEscrowFetchAndUnlock = (
+  baseUrl: string,
+  handle: string,
+  password: string | null,
+  secretKeyHex: string,
+) =>
+  invoke<ServerStatus>("server_escrow_fetch_and_unlock", {
+    baseUrl,
+    handle,
+    password,
+    secretKeyHex,
+  });
+/** Restore this device's identity OFFLINE from an Emergency-Kit keyset FILE (`identity.kit`
+ *  — the raw EncryptedKeyset bytes), then self-enroll THIS device and sign in (PUBLIC — no
+ *  session): the escrow tail with the blob sourced from a file instead of the server's escrow.
+ *  `password` is null for passwordless/SSO accounts; `secretKeyHex` is the account Secret Key
+ *  (also in the Emergency Kit). No prior link/session needed — a brand-new device holding only
+ *  the kit file + Secret Key can recover. Returns the resulting linked-server status (mirrors
+ *  the escrow path). Zero-knowledge: password / Secret Key / bytes go straight to the Rust
+ *  command (only the core FFI sees them); never logged. */
+export const serverImportKeysetAndUnlock = (
+  baseUrl: string,
+  keysetBytes: number[],
+  password: string | null,
+  secretKeyHex: string,
+) =>
+  invoke<ServerStatus>("server_import_keyset_and_unlock", {
+    baseUrl,
+    keysetBlob: keysetBytes,
+    password,
+    secretKeyHex,
+  });
+export const serverOnboardInitiate = (serverId?: string) =>
+  invoke<PairingPayload>("server_onboard_initiate", { serverId: serverId ?? null });
+export const serverOnboardComplete = (channelId: string, oobCode: string, serverId?: string) =>
+  invoke<void>("server_onboard_complete", { channelId, oobCode, serverId: serverId ?? null });
+export const serverOnboardJoin = (payload: PairingPayload, password: string | null) =>
+  invoke<ServerStatus>("server_onboard_join", {
+    baseUrl: payload.baseUrl,
+    instanceId: payload.instanceId,
+    spaceId: payload.spaceId,
+    accountId: payload.accountId,
+    deviceId: payload.deviceId,
+    channelId: payload.channelId,
+    oobCode: payload.oobCode,
+    password,
+  });
+
+// ── cloud audit (read-only) ────────────────────────────────────
+export const serverAuditQuery = (sinceSeq?: number, serverId?: string) =>
+  invoke<AuditEntry[]>("server_audit_query", {
+    sinceSeq: sinceSeq ?? null,
+    serverId: serverId ?? null,
+  });
+
+export interface McpRecordingPreferences { maxBytes: number; retentionDays: number | null }
+export const mcpRecordingPreferences = () => invoke<McpRecordingPreferences>("mcp_recording_preferences");
+export const setMcpRecordingPreferences = (value: McpRecordingPreferences) => invoke<void>("set_mcp_recording_preferences", { value });

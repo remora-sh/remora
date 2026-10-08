@@ -1,0 +1,23 @@
+[package]
+name = "unissh-vault"
+version.workspace = true
+description = "UniSSH local vaults: Vault Key, per-item keys, item encryption with associated-data binding (spec 5.2–5.3, the local part)."
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+unissh-crypto = { path = "../crypto" }
+unissh-keychain = { path = "../keychain" }
+unissh-storage = { path = "../storage" }
+zeroize = "1.8"
+thiserror = "2"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+unissh-keychain = { path = "../keychain" }
+unissh-crypto = { path = "../crypto" }

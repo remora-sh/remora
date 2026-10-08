@@ -1,0 +1,528 @@
+//! Remora Tauri backend — wires the `unissh_ffi::Core` into Tauri commands.
+
+mod biometric;
+mod cloud;
+mod commands;
+mod dto;
+mod error;
+mod keychain;
+#[cfg(desktop)]
+mod mcp;
+mod observers;
+mod platform_tls;
+mod state;
+// Desktop-only: the OS lock/suspend listeners have no counterpart on a phone,
+// and compiling the module there would only carry dead code (see its docs).
+#[cfg(desktop)]
+mod system_agent;
+#[cfg(desktop)]
+mod system_lock;
+
+use tauri::Manager;
+use unissh_ffi::Core;
+
+use crate::state::AppState;
+
+/// Parse the log level directive from `UNISSH_LOG` (preferred) or `RUST_LOG`.
+/// Format: a global level optionally followed by `module=level` overrides, e.g.
+/// `info,unissh_sync=debug,russh=info`. Unparseable parts are ignored; the global
+/// level defaults to Info. Lets an operator raise verbosity without a rebuild.
+fn log_filter_from_env() -> (log::LevelFilter, Vec<(String, log::LevelFilter)>) {
+    let directive = std::env::var("UNISSH_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_default();
+    let mut global = log::LevelFilter::Info;
+    let mut overrides = Vec::new();
+    for part in directive
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((module, level)) = part.split_once('=') {
+            let module = module.trim();
+            if let (false, Ok(lf)) = (module.is_empty(), level.trim().parse::<log::LevelFilter>()) {
+                overrides.push((module.to_string(), lf));
+            }
+        } else if let Ok(lf) = part.parse::<log::LevelFilter>() {
+            global = lf;
+        }
+    }
+    (global, overrides)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // Logging first, so every later plugin/command is captured. Sinks: stdout,
+    // a rotating file in the per-OS app log dir, and the webview console.
+    // Redaction rule (mirrors the server, spec §13): NEVER log private keys,
+    // passphrases, the master password, the Secret Key, tokens, vault plaintext
+    // or full pubkeys/blobs — only metadata (host/port/user, fingerprints, ids,
+    // error kinds, counters). See SECURITY.md.
+    let (log_level, log_overrides) = log_filter_from_env();
+    let mut log_builder = tauri_plugin_log::Builder::new()
+        .level(log_level)
+        // SDK diagnostics include raw commands/output, even at info level.
+        .filter(|m| {
+            #[cfg(desktop)]
+            {
+                unissh_mcp::diagnostics_allowed(m.target())
+            }
+            #[cfg(mobile)]
+            {
+                let _ = m;
+                true
+            }
+        })
+        // Bounded retention: rotate at ~5 MB and keep the current + one rotated
+        // file (~10 MB cap) — enough history to diagnose, but it never grows
+        // forever (the plugin default is a tiny 40 KB).
+        .max_file_size(5_000_000)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+        .targets([
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None }),
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+        ]);
+    // russh is chatty and may carry sensitive context — default it to warn unless
+    // the operator explicitly set a russh level via the env directive.
+    if !log_overrides.iter().any(|(m, _)| m == "russh") {
+        log_builder = log_builder.level_for("russh", log::LevelFilter::Warn);
+    }
+    for (module, level) in log_overrides {
+        log_builder = log_builder.level_for(module, level);
+    }
+
+    let mut builder = tauri::Builder::default()
+        .plugin(log_builder.build())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init());
+
+    // The mobile biometric plugin is registered but not yet called by anything
+    // (mobile biometric unlock is its own, unbuilt, feature). Desktop biometric
+    // unlock does not use it: see src/biometric.rs.
+    #[cfg(mobile)]
+    {
+        builder = builder.plugin(tauri_plugin_biometric::init());
+    }
+
+    // Auto-update is desktop-only: mobile ships as sideload artifacts that the
+    // user re-installs by hand, so there is nothing for an updater to replace.
+    // Registering it on mobile would only expose a command that always fails.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+
+    builder
+        .setup(|app| {
+            // One local instance = two files in the app-data dir: the SQLCipher DB
+            // and the encrypted keyset sidecar. The DB key is derived from the
+            // unlocked keyset, so neither opens without unlocking.
+            let dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&dir).ok();
+            let db_path = dir.join("instance.db");
+            let keyset_path = dir.join("instance.keyset.bin");
+            let core: std::sync::Arc<Core> = Core::new(
+                db_path.to_string_lossy().to_string(),
+                keyset_path.to_string_lossy().to_string(),
+            );
+            // Registered before anything can connect: a server may demand a
+            // second factor on the very first connection, and a prompter wired
+            // up later would miss it.
+            let prompter =
+                std::sync::Arc::new(crate::observers::AppPrompter::new(app.handle().clone()));
+            core.set_auth_prompter(Some(prompter.clone()));
+            #[cfg(desktop)]
+            {
+                let controller = mcp::Controller::new(core.clone(), prompter.clone(), dir.join("mcp.json"));
+                controller.resume();
+                app.manage(controller);
+                let agent = system_agent::Controller::new(
+                    app.handle(),
+                    core.clone(),
+                    dir.join("system-agent.json"),
+                );
+                agent.resume();
+                app.manage(agent);
+            }
+            app.manage(prompter);
+            // Registered up front for the same reason: a forwarded agent that
+            // finds no approver refuses every signature, which is safe but looks
+            // like a broken feature.
+            let approver =
+                std::sync::Arc::new(crate::observers::AppApprover::new(app.handle().clone()));
+            core.set_agent_approver(Some(approver.clone()));
+            app.manage(approver);
+            let app_state = AppState::new(core, db_path, keyset_path);
+            // Token rotation, wired before any request can be made. The HTTP
+            // layer is where an expired access token is discovered — including
+            // on the sync transport, which never passes through a command — and
+            // this is what it calls to get a fresh one instead of surfacing
+            // "access token expired" and waiting for the user to press Refresh.
+            let cloud = app_state.cloud.clone();
+            crate::cloud::client::set_reauth(std::sync::Arc::new(move |stale: &str| {
+                cloud.rotate_expired_access(stale)
+            }));
+            app.manage(app_state);
+
+            // macOS 26 (Tahoe): an app built against SDK 26 gets the redesigned,
+            // noticeably larger control-size metrics — the traffic lights render
+            // ~16pt instead of the classic ~14pt and read as oversized next to
+            // the toolbar. Opt back into compact metrics on the window's ROOT
+            // view (the content view's superview, the frame that also hosts the
+            // titlebar): the property propagates down a view's subtree, so
+            // setting it on the content view alone never reached the buttons.
+            // The selector only exists on macOS 26+, so probe first: older
+            // systems never show the large controls and the call is skipped.
+            #[cfg(target_os = "macos")]
+            {
+                use objc2::runtime::AnyObject;
+                use objc2::{msg_send, sel};
+                if let Some(window) = app.get_webview_window("main") {
+                    if let Ok(ns_win) = window.ns_window() {
+                        let ns_win = ns_win as *mut AnyObject;
+                        if !ns_win.is_null() {
+                            unsafe {
+                                let content: *mut AnyObject = msg_send![ns_win, contentView];
+                                let root: *mut AnyObject = if content.is_null() {
+                                    content
+                                } else {
+                                    msg_send![content, superview]
+                                };
+                                let responds: bool = if root.is_null() {
+                                    false
+                                } else {
+                                    msg_send![root, respondsToSelector: sel!(setPrefersCompactControlSizeMetrics:)]
+                                };
+                                if responds {
+                                    let _: () = msg_send![root, setPrefersCompactControlSizeMetrics: true];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // iOS: by default WKWebView adjusts its scroll-view content insets for
+            // the safe area, which confines the web layout to (screen − safe
+            // insets) — e.g. 839 of a 932px screen — and leaves a dead band below
+            // the bottom tab bar that CSS can't paint into (the layout viewport,
+            // and even position:fixed, stop at the inset edge). Setting the inset
+            // adjustment to `.never` makes the webview lay out edge-to-edge; the
+            // notch/home-indicator are then handled purely by CSS
+            // env(safe-area-inset-*) padding on the shell and tab bar.
+            #[cfg(target_os = "ios")]
+            {
+                use objc2::msg_send;
+                use objc2::runtime::AnyObject;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.with_webview(|wv| {
+                        let wk = wv.inner() as *mut AnyObject; // the WKWebView
+                        if wk.is_null() {
+                            return;
+                        }
+                        // UIScrollViewContentInsetAdjustmentBehavior::Never == 2
+                        unsafe {
+                            let scroll: *mut AnyObject = msg_send![wk, scrollView];
+                            if !scroll.is_null() {
+                                let _: () =
+                                    msg_send![scroll, setContentInsetAdjustmentBehavior: 2isize];
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Follow the OS out of the room: a screen lock or a suspend locks
+            // the vault the same way the lock button does. Best-effort by
+            // design — a desktop that emits neither signal simply behaves as it
+            // did before. Desktop-only; nothing is registered on mobile.
+            #[cfg(desktop)]
+            crate::system_lock::start(app.handle());
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            #[cfg(desktop)] mcp::mcp_status,
+            #[cfg(desktop)] mcp::mcp_set_enabled,
+            #[cfg(desktop)] mcp::mcp_create_integration,
+            #[cfg(desktop)] mcp::mcp_rotate_integration,
+            #[cfg(desktop)] mcp::mcp_delete_integration,
+            #[cfg(desktop)] mcp::mcp_grant,
+            #[cfg(desktop)] mcp::mcp_revoke,
+            #[cfg(desktop)] mcp::mcp_approve,
+            #[cfg(desktop)] mcp::mcp_targets,
+            #[cfg(desktop)] mcp::mcp_close_session,
+            #[cfg(desktop)] mcp::mcp_cancel_command,
+            #[cfg(desktop)] mcp::mcp_inspect_command,
+            #[cfg(desktop)] mcp::mcp_search_commands,
+            #[cfg(desktop)] system_agent::system_agent_status,
+            #[cfg(desktop)] system_agent::system_agent_set_enabled,
+            #[cfg(desktop)] system_agent::system_agent_shared_keys,
+            #[cfg(desktop)] system_agent::system_agent_set_shared,
+            // account / instance
+            commands::instance_status,
+            commands::terminal_workspace_load,
+            commands::terminal_workspace_save,
+            commands::reset_partial_instance,
+            commands::reset_instance,
+            commands::log_dir,
+            commands::system_lock_ack,
+            commands::reveal_log_dir,
+            commands::tiling_session,
+            commands::create_account,
+            commands::unlock,
+            commands::lock,
+            commands::is_unlocked,
+            commands::set_keepalive_secs,
+            commands::change_password,
+            commands::account_id,
+            // vaults
+            commands::list_vaults,
+            commands::create_vault,
+            commands::rename_vault,
+            commands::delete_vault,
+            commands::purge_vault,
+            commands::verify_vault_integrity,
+            commands::vault_export_backup,
+            commands::vault_import_backup,
+            commands::check_consistency,
+            // items / keys / certs
+            commands::list_items,
+            commands::generate_ssh_key,
+            commands::import_ssh_key,
+            commands::import_ssh_certificate,
+            commands::get_public_key,
+            commands::export_ssh_key,
+            commands::rotate_ssh_key,
+            commands::begin_key_rotation,
+            commands::finish_key_rotation,
+            commands::abandon_key_rotation,
+            commands::list_key_rotations,
+            commands::rename_item,
+            commands::delete_item,
+            commands::list_item_versions,
+            // passwords
+            commands::save_password,
+            commands::get_password,
+            commands::get_password_version,
+            // notes
+            commands::save_note,
+            commands::get_note,
+            commands::get_note_version,
+            // known hosts
+            commands::list_known_hosts,
+            commands::forget_host,
+            commands::trust_host,
+            commands::import_known_hosts,
+            // connection profiles
+            commands::save_connection,
+            commands::list_connections,
+            commands::get_connection,
+            commands::delete_connection,
+            // identities (personal SSH creds)
+            commands::save_identity,
+            commands::list_identities,
+            commands::get_identity,
+            commands::delete_identity,
+            // identity bindings (personal vault ↔ shared host)
+            commands::set_binding,
+            commands::get_binding,
+            commands::list_bindings,
+            commands::delete_binding,
+            commands::resolve_host_binding,
+            commands::resolve_personal_auth,
+            commands::personal_destination,
+            commands::apply_username_template,
+            commands::import_ssh_config,
+            commands::import_ssh_config_at_path,
+            commands::export_ssh_config,
+            commands::import_putty_sessions,
+            // groups
+            commands::save_group,
+            commands::list_groups,
+            commands::get_group,
+            commands::delete_group,
+            commands::dry_run_group,
+            // exec / fleet
+            commands::ssh_exec,
+            commands::ssh_exec_multi,
+            commands::ssh_exec_by_tags,
+            commands::ssh_exec_group,
+            // streaming exec
+            commands::exec_stream_open,
+            commands::exec_stream_write,
+            commands::exec_stream_close,
+            // PTY sessions
+            commands::session_open,
+            commands::session_open_reconnecting,
+            commands::session_write,
+            commands::session_resize,
+            commands::session_close,
+            // local terminal (write/resize/close are the session_* ones above)
+            commands::local_session_open,
+            commands::local_shell_default,
+            commands::local_shell_split_args,
+            // broadcast
+            commands::broadcast_open,
+            commands::broadcast_write_all,
+            commands::broadcast_resize_all,
+            commands::broadcast_close,
+            // tunnels
+            commands::tunnel_open_local,
+            commands::tunnel_open_dynamic,
+            commands::tunnel_open_remote,
+            commands::tunnel_close,
+            // sftp
+            commands::sftp_open,
+            commands::sftp_relay,
+            commands::sftp_list_dir_cancel,
+            commands::sftp_invalidate,
+            commands::sftp_commit,
+            commands::sftp_fingerprint,
+            commands::sftp_set_metadata,
+            commands::local_realpath,
+            commands::local_same_file,
+            commands::local_create_private,
+            commands::local_copy_prepared,
+            commands::local_commit,
+            commands::local_set_metadata,
+            commands::local_read_text,
+            commands::local_list_dir,
+            commands::local_lstat,
+            commands::local_readlink,
+            commands::local_symlink,
+            commands::local_unlink,
+            commands::local_volumes,
+            commands::sftp_list_dir,
+            commands::sftp_stat,
+            commands::sftp_lstat,
+            commands::sftp_readlink,
+            commands::sftp_symlink,
+            commands::sftp_realpath,
+            commands::sftp_reopen,
+            commands::sftp_chmod,
+            commands::sftp_mkdir,
+            commands::sftp_create_new_file,
+            commands::sftp_rmdir,
+            commands::sftp_rmdir_recursive,
+            commands::sftp_remove,
+            commands::sftp_rename,
+            commands::sftp_read_file,
+            commands::sftp_write_file,
+            commands::sftp_download,
+            commands::sftp_upload,
+            commands::sftp_close,
+            // cancel tokens
+            commands::cancel_new,
+            commands::cancel_trigger,
+            commands::cancel_dispose,
+            commands::submit_auth_prompt,
+            commands::submit_agent_approval,
+            commands::set_algorithm_policy,
+            commands::ssh_config_report,
+            commands::ssh_config_report_at_path,
+            commands::system_agent_keys,
+            commands::list_recordings,
+            commands::mcp_recording_preferences,
+            commands::set_mcp_recording_preferences,
+            commands::get_recording,
+            commands::delete_recording,
+            commands::save_snippet,
+            commands::list_snippets,
+            commands::delete_snippet,
+            // keychain (Secret Key on trusted device)
+            keychain::keychain_available,
+            keychain::keychain_save_secret_key,
+            keychain::keychain_get_secret_key,
+            keychain::keychain_unlock,
+            keychain::keychain_delete_secret_key,
+            // unlock with Touch ID (macOS) or Windows Hello (Windows); reports
+            // unsupported elsewhere
+            biometric::biometric_status,
+            biometric::biometric_enable,
+            biometric::biometric_disable,
+            biometric::biometric_unlock,
+            biometric::biometric_presence_unlock,
+            biometric::biometric_confirm_presence,
+            // cloud server — identity / session / devices
+            cloud::commands::server_status,
+            cloud::commands::server_instance_info,
+            cloud::commands::server_list,
+            cloud::commands::server_set_active,
+            cloud::commands::server_remove,
+            cloud::commands::server_join,
+            cloud::commands::server_claim,
+            cloud::commands::server_oidc_login,
+            cloud::commands::server_login,
+            cloud::commands::server_refresh_session,
+            cloud::commands::server_logout,
+            cloud::commands::server_disconnect,
+            cloud::commands::server_join_preview,
+            cloud::commands::server_device_add,
+            cloud::commands::server_list_devices,
+            cloud::commands::server_device_revoke,
+            cloud::commands::server_account_profile,
+            // cloud vaults + sync
+            cloud::commands::server_create_cloud_vault,
+            cloud::commands::server_bind_unbound_cloud_vaults,
+            cloud::commands::server_bind_cloud_vault,
+            cloud::commands::server_unbind_cloud_vault,
+            cloud::commands::server_sync_now,
+            cloud::commands::server_repull,
+            cloud::commands::server_restore_deleted_vaults,
+            cloud::commands::server_list_vaults,
+            cloud::commands::server_pull_vault,
+            cloud::commands::server_bind_and_push_vault,
+            cloud::commands::server_move_vault_to_server,
+            // cloud membership / sharing
+            cloud::commands::server_list_accounts,
+            cloud::commands::server_add_member,
+            cloud::commands::server_list_members,
+            cloud::commands::server_member_fingerprint,
+            cloud::commands::server_confirm_member_pin,
+            cloud::commands::server_pin_vault_genesis_owner,
+            cloud::commands::set_personal_vault,
+            cloud::commands::set_account_default_username,
+            cloud::commands::get_personal_vault,
+            cloud::commands::get_account_default_username,
+            cloud::commands::server_rotate_vk,
+            // cloud spaces / directory / pending / attestations / invites (server-v2)
+            cloud::commands::server_invite,
+            cloud::commands::server_list_spaces,
+            cloud::commands::server_create_space,
+            cloud::commands::server_add_space_member,
+            cloud::commands::server_directory,
+            cloud::commands::server_pending,
+            cloud::commands::server_attestations_put,
+            cloud::commands::server_attestations_list,
+            // cloud devices / onboarding (Path A keyset escrow, Path B PAKE relay)
+            cloud::commands::server_keyset_push,
+            cloud::commands::server_keyset_pull_and_unlock,
+            cloud::commands::server_escrow_params,
+            cloud::commands::server_escrow_fetch_and_unlock,
+            cloud::commands::server_import_keyset_and_unlock,
+            cloud::commands::server_onboard_initiate,
+            cloud::commands::server_onboard_complete,
+            cloud::commands::server_onboard_join,
+            // cloud audit (read-only)
+            cloud::commands::server_audit_query,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building UniSSH")
+        .run(|app, event| {
+            #[cfg(desktop)]
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                mcp::revoke(app);
+                system_agent::shutdown(app);
+            }
+            #[cfg(mobile)]
+            let _ = (app, event);
+        });
+}

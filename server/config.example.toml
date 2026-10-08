@@ -1,0 +1,121 @@
+# UniSSH Server — example configuration (spec §14.2).
+# Hierarchy: defaults → this TOML → env (UNISSH__SECTION__KEY=...).
+# Secrets (tls_key, postgres url) — via env/Docker secret. The ops token is an
+# optional break-glass (see [ops]), not a required secret.
+
+[server]
+bind = "0.0.0.0:8443"
+# In-process TLS 1.3 (rustls). Leave empty + trust_proxy=true for termination
+# on a reverse-proxy (nginx/caddy).
+tls_cert = "/secrets/cert.pem"
+tls_key  = "/secrets/key.pem"
+trust_proxy = false
+acme = false                      # in-process ACME is NOT built in: acme=true → startup
+                                  # refusal. Use a reverse-proxy (Caddy/nginx)
+                                  # or tls_cert+tls_key.
+# Public base URL for rendering invite links (empty → clients compose their own).
+public_url = ""
+
+[db]
+backend = "sqlite"                # "sqlite" | "postgres"
+url = "/app/data/unissh.db"       # sqlite: path to file (or ":memory:"); postgres: postgres://user:pass@host/db
+max_connections = 16
+
+[limits]
+max_body_bytes = 16777216         # 16 MiB
+max_object_bytes = 1048576        # 1 MiB
+max_objects_per_push = 1000
+delta_page_size = 500
+delta_max_page_size = 1000
+rate_limit_per_ip_rps = 20
+rate_limit_burst = 40
+
+[sync]
+freshness_window_seconds = 30     # W for online-only live grants (§9.7)
+validate_signatures = true        # §2.4 defense-in-depth (org-tier write-accept)
+min_instance_generation = 0       # §16 anti-rollback floor (Σ next_seq); 0 = off,
+                                  # anchor outside the DB; the server won't start if below
+
+[session]
+access_ttl_seconds = 900
+refresh_ttl_seconds = 2592000
+nonce_ttl_seconds = 120
+invite_default_ttl_seconds = 86400
+relay_ttl_seconds = 120
+janitor_interval_seconds = 300
+idempotency_ttl_seconds = 86400
+
+[obs]
+log_format = "json"               # "json" | "text"
+otel_endpoint = ""                # OTLP export is NOT compiled in: if set — warn
+                                  # at startup. Metrics: /metrics; tracing: logs/sidecar.
+metrics_bind = "127.0.0.1:9090"
+
+[setup]
+# code = "" → empty → a random setup code is printed to the server log on first
+# boot (while the instance is unclaimed); the first user claims the instance with
+# it. Set a value to pin a deterministic code for IaC/tests — a pinned code is
+# NEVER printed to the log (you already hold it; logging it would only spread it).
+# Only sha256(code) is persisted, so a generated code cannot be printed twice: if
+# the boot log is gone, `unissh-server setup-code --rotate --config <this file>`
+# issues a new one (data untouched, no restart, old code invalidated). Without
+# --rotate the same command only reports where the code stands.
+# Env: UNISSH__SETUP__CODE=...
+code = ""
+
+[oidc]
+# SSO seam (Phase 5): disabled by default. Env: UNISSH__OIDC__*
+enabled = false
+issuer = ""                       # IdP issuer URL, e.g. https://idp.example.com
+client_id = ""
+audience = ""                     # expected id_token `aud`; empty → falls back to client_id
+jwks_url = ""                     # empty → derived as {issuer}/.well-known/jwks.json
+groups_claim = "groups"           # id_token claim holding the user's group list
+max_reassertion_age_seconds = 604800  # 7 days: max silent session reassertion before full re-auth
+# IdP-group → space grants applied on OIDC callback (empty by default). Repeat
+# the block per mapping; each maps an IdP group to a space membership at a role:
+# [[oidc.group_map]]
+# group = "engineering"
+# space_id = "<space-id>"
+# role = "member"
+
+[ops]
+# Optional break-glass for /v1/ops/* (X-UniSSH-Ops-Token header); empty → disabled.
+# Server-trusted infrastructure access (overview/instance/seq-bump), NOT a keyset —
+# grants no decryption. Set via env: UNISSH__OPS__TOKEN=...
+token = ""
+
+[audit]
+# Audit export sinks. Each sink is optional; an absent section means no sink,
+# and sinks are configured here only (never through the API). Delivery is
+# at-least-once from a persisted cursor: a restart resumes where it left off and
+# a batch may arrive twice, so receivers dedupe on `seq`.
+#
+# Webhook: POSTs batches of entries as JSON, signed with
+# `X-UniSSH-Signature: sha256=<hex HMAC-SHA256 of the body>`. A 2xx acknowledges;
+# anything else (or a timeout) retries the same batch with backoff (1 s .. 5 min).
+# The secret is never written here: name an environment variable OR a file.
+# The HMAC key is the secret's literal bytes (never hex/base64-decoded). Use https.
+# A webhook without a readable secret refuses to start the server.
+# Env: UNISSH__AUDIT__WEBHOOK__URL, UNISSH__AUDIT__WEBHOOK__SECRET_ENV, ...
+# [audit.webhook]
+# url = "https://siem.example.com/unissh"
+# secret_env = "UNISSH_AUDIT_WEBHOOK_SECRET"   # or: secret_file = "/run/secrets/audit_webhook"
+# batch_size = 100
+# timeout_secs = 10
+#
+# Syslog: one RFC 5424 message per entry, structured data
+# [unissh@32473 seq event space_id vault_id], body = the entry JSON (base64 for a
+# client-signed entry), UTF-8 sent as MSG-ANY without a BOM. 32473 is RFC 5612's
+# documentation PEN (UniSSH has none by design); `unissh@32473` is a frozen wire
+# identifier. UDP sends and forgets: the cursor advances once the datagrams are
+# sent, so a lost datagram is lost, and an entry larger than one datagram
+# (~64 KB) is skipped with a warning. TCP (octet counting, RFC 6587) advances only after the
+# write succeeds. No TLS: send to a local forwarder for that.
+# Both sinks may be set at once; each keeps its own cursor.
+# Env: UNISSH__AUDIT__SYSLOG__ADDRESS, UNISSH__AUDIT__SYSLOG__PROTOCOL, ...
+# [audit.syslog]
+# address = "127.0.0.1:514"   # host:port; IPv6 in brackets: "[::1]:514"
+# protocol = "tcp"            # "tcp" (default) or "udp"
+# facility = "auth"           # kern, user, ..., auth, authpriv, ..., local0..local7
+# app_name = "unissh"

@@ -1,0 +1,5277 @@
+// Settings — sub-nav: Appearance / General / Security / About.
+// Pixel-faithful port of view-settings.jsx, wired to the real theme store,
+// localStorage-persisted preferences, and core api.* calls. No mock build/
+// platform strings: the About panel reads real platform info from plugin-os,
+// and the danger zone clears real known_hosts via api.forgetHost.
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { usePalette, useTheme } from "@/theme/ThemeProvider";
+import {
+  ACCENT_KEYS,
+  ACCENTS,
+  DEFAULT_UI_SCALE,
+  MONO,
+  rem,
+  rgba,
+  sanitizeUiScale,
+  TERM_FONTS,
+  TERM_SCROLLBACK_LIMIT,
+  TERM_SCROLLBACK_MIN,
+  TERM_SCROLLBACK_STEP,
+  termScrollbackBytes,
+  TEXT,
+  toHexInput,
+  UI,
+  UI_SCALES,
+} from "@/theme/tokens";
+import type {
+  AppThemeFamily,
+  Density,
+  HostsLayout,
+  Mode,
+  Palette,
+  TermCursorStyle,
+  TermFontId,
+  TermTheme,
+} from "@/theme/tokens";
+import { Btn, Field, Icon, Input, NHSelect, NO_AUTOCORRECT, Segmented, Spinner, Tag, Toggle, VaultBadge } from "@/components/primitives";
+import { useWindowControls } from "@/shell/WindowChrome";
+import type { ControlsSide } from "@/shell/windowControls";
+import { exportPath } from "@/support/paths";
+import { ServerVaultsSection } from "./ServerVaultsSection";
+import { Modal } from "@/components/Modal";
+import type { IconName } from "@/components/primitives";
+import { forgetTerminalWorkspace, moveTerminalWorkspace, useApp } from "@/store/app";
+import { localShellSettings, setLocalShellSetting, useLocalMachine } from "@/store/localShell";
+import { useCtx } from "@/store/ctx";
+import { toast } from "@/store/toast";
+import { guard } from "@/store/action";
+import * as api from "@/bridge/api";
+import { isOwnedCloud, serverShortLabel, vaultServer } from "@/bridge/vaults";
+import { planMoveToServer } from "@/bridge/moveToServer";
+import {
+  apiErrorMessage,
+  isServerErrorCode,
+  ItemType,
+  type AccountInfo,
+  type AuditEntry,
+  type BiometricStatus,
+  type DeviceInfo,
+  type InstanceInfo,
+  type JoinPreview,
+  type ItemInfo,
+  type MemberInfo,
+  type MemberRole,
+  type PairingPayload,
+  type ServerStatus,
+  type SpaceInfo,
+  type VaultInfo,
+  type DbConsistencyReport,
+  type VaultIntegrityReport,
+} from "@/bridge/types";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { writeSecretToClipboard } from "@/bridge/clipboard";
+import { readSecretKeyOnce } from "@/bridge/secretKey";
+import { getVersion } from "@tauri-apps/api/app";
+import { arch, platform, version as osVersion } from "@tauri-apps/plugin-os";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { readFile } from "@tauri-apps/plugin-fs";
+import { useTranslation, setLang, currentLang, tDyn, LANGS, LANG_LABELS } from "@/i18n";
+import type { Lang } from "@/i18n";
+import { useFmt } from "@/i18n/format";
+import { useIsMobile, useNarrow } from "@/store/responsive";
+import { useUpdate } from "@/store/update";
+import { updatesSupported } from "@/bridge/updater";
+import { biometricMethod, isDesktopOs, isMac, isWindows, osPlatform } from "@/bridge/platform";
+import { SettingsShortcuts } from "./SettingsShortcuts";
+import { SettingsSupport } from "./SettingsSupport";
+import { SettingsSystemAgent } from "./SettingsSystemAgent";
+import { TerminalPreview } from "./TerminalPreview";
+
+// ── localStorage helpers ───────────────────────────────────────
+function lsGet(key: string, fallback: string): string {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function lsSet(key: string, val: string) {
+  try {
+    localStorage.setItem(key, val);
+  } catch {
+    /* ignore */
+  }
+}
+
+// ── shared layout atoms (mirroring the prototype) ──────────────
+export function SettingRow({
+  title,
+  desc,
+  children,
+}: {
+  title: string;
+  desc?: string;
+  children: React.ReactNode;
+}) {
+  const p = usePalette();
+  // Keep the control inline with the label and let it WRAP to the next line only
+  // when it genuinely doesn't fit (flexWrap) — a small button stays in the remaining
+  // space, a wide control (Segmented) drops below on its own. minWidth:0 lets a long
+  // RU title wrap instead of forcing the control off the row.
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: rem(16),
+        rowGap: rem(12),
+        padding: `${rem(16)} 0`,
+        borderBottom: `1px solid ${p.line}`,
+      }}
+    >
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: TEXT.body, fontWeight: 700 }}>{title}</div>
+        {desc && <div style={{ fontSize: TEXT.base, color: p.txt3, marginTop: rem(2) }}>{desc}</div>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** Exported so the Support panel (SettingsSupport.tsx) uses the same section heading as
+ *  every other settings pane rather than a look-alike of its own. */
+export function SectionLabel({ children, first }: { children: React.ReactNode; first?: boolean }) {
+  const p = usePalette();
+  return (
+    <div
+      style={{
+        fontSize: TEXT.micro,
+        fontWeight: 700,
+        letterSpacing: rem(0.6),
+        color: p.txt3,
+        textTransform: "uppercase",
+        marginTop: first ? rem(4) : rem(26),
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function inputStyle(p: Palette, mono?: boolean): React.CSSProperties {
+  return {
+    width: "100%",
+    boxSizing: "border-box",
+    padding: `${rem(9)} ${rem(12)}`,
+    fontFamily: mono ? MONO : UI,
+    fontSize: TEXT.base,
+    color: p.txt,
+    background: p.bg0,
+    border: `1px solid ${p.line2}`,
+    borderRadius: 8,
+    outline: "none",
+  };
+}
+
+// ── Appearance ─────────────────────────────────────────────────
+
+/** Small overlaid edit/delete control on a custom theme card. Kept as a sibling
+ *  of the (selection) card button rather than nested, to avoid a button-in-button. */
+function ThemeCardAction({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: IconName;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      title={label}
+      aria-label={label}
+      onClick={onClick}
+      style={{
+        width: rem(22),
+        height: rem(22),
+        borderRadius: 6,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "pointer",
+        background: "rgba(0,0,0,0.45)",
+        border: "1px solid rgba(255,255,255,0.18)",
+        color: "#fff",
+      }}
+    >
+      <Icon name={icon} size={12} color="#fff" />
+    </button>
+  );
+}
+
+/** Which of the offered fonts this machine actually has. Only JetBrains Mono is bundled;
+ *  the rest silently fall back to it if absent, and a picker that hides that is a picker
+ *  that lies. */
+function useInstalledFonts(): Set<string> {
+  const [installed, setInstalled] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let alive = true;
+    const probe = () => {
+      if (!alive) return;
+      const found = new Set<string>();
+      for (const f of TERM_FONTS) {
+        // The bundled face is always available; probing it can race webfont loading.
+        if (f.id === "jetbrains" || f.id === "system") {
+          found.add(f.id);
+          continue;
+        }
+        try {
+          if (document.fonts.check(`12px ${f.stack.split(",")[0]}`)) found.add(f.id);
+        } catch {
+          /* older webview without FontFaceSet — leave it unmarked */
+        }
+      }
+      setInstalled(found);
+    };
+    void (document.fonts?.ready?.then(probe).catch(probe) ?? probe());
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return installed;
+}
+
+function SettingsAppearance() {
+  const isPhone = useIsMobile();
+  const gpuRendering = useApp((s) => s.gpuRendering);
+  const setGpuRendering = useApp((s) => s.setGpuRendering);
+  const terminalImages = useApp((s) => s.terminalImages);
+  const setTerminalImages = useApp((s) => s.setTerminalImages);
+  const customChrome = useApp((s) => s.customChrome);
+  const setCustomChrome = useApp((s) => s.setCustomChrome);
+  const setWindowControlsSide = useApp((s) => s.setWindowControlsSide);
+  // Both the row's visibility and the segment it lights come from the one
+  // decision: `custom` is exactly "we draw the buttons, so their corner is a
+  // question worth asking". macOS (`native`), the system frame and a browser
+  // preview (`none`) are not offered a choice that cannot apply.
+  const controls = useWindowControls();
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const {
+    mode,
+    setMode,
+    family,
+    setFamily,
+    accent,
+    setAccent,
+    density,
+    setDensity,
+    uiScale,
+    setUiScale,
+    hostsLayout,
+    setHostsLayout,
+    termThemeId,
+    setTermThemeId,
+    termThemes,
+    customThemes,
+    deleteTermTheme,
+    resetTermTheme,
+    effMode,
+    termTheme,
+    termPrefs,
+    setTermPrefs,
+    resetTermPrefs,
+  } = useTheme();
+  const { fmtSize } = useFmt();
+  const installedFonts = useInstalledFonts();
+  const [showAllThemes, setShowAllThemes] = useState(false);
+  // Themes for the mode you are actually in first — at eighteen cards, a dark-theme user
+  // scrolling past eight light ones to reach the rest is the whole problem.
+  const orderedThemes = useMemo(() => {
+    const wantLight = effMode === "light";
+    return [...termThemes].sort(
+      (a, b) => Number(!!b.light === wantLight) - Number(!!a.light === wantLight),
+    );
+  }, [termThemes, effMode]);
+  const visibleThemes = showAllThemes ? orderedThemes : orderedThemes.slice(0, 8);
+  const openModal = useApp((s) => s.openModal);
+  const setConfirm = useApp((s) => s.setConfirm);
+  const termZoom = useApp((s) => s.termZoom);
+  const bumpTermZoom = useApp((s) => s.bumpTermZoom);
+  const resetTermZoom = useApp((s) => s.resetTermZoom);
+  const [customizeOpen, setCustomizeOpen] = useState(false);
+  const customIds = new Set(customThemes.map((c) => c.id));
+  const confirmDeleteTheme = (th: TermTheme) =>
+    setConfirm({
+      title: t("termtheme.deleteTitle"),
+      body: t("termtheme.deleteBody", { name: th.name }),
+      danger: true,
+      icon: "trash",
+      confirmLabel: t("termtheme.deleteConfirm"),
+      onConfirm: () => deleteTermTheme(th.id),
+    });
+
+  return (
+    <>
+      <SectionLabel first>{t("settings.sectionApp")}</SectionLabel>
+      {/* Two orthogonal axes, one block: palette family, then light/dark/auto —
+          replacing the old family+mode combo <select> that duplicated the mode
+          Segmented and could drift out of sync with it. */}
+      <SettingRow title={t("settings.themePickerTitle")} desc={t("settings.themeFamilyDesc")}>
+        <Segmented<AppThemeFamily>
+          value={family}
+          onChange={setFamily}
+          options={[
+            { value: "mono", label: t("settings.themeFamilyMono") },
+            { value: "nebula", label: t("settings.themeFamilyNebula") },
+            { value: "barbie", label: t("settings.themeFamilyBarbie") },
+          ]}
+        />
+      </SettingRow>
+      <SettingRow title={t("settings.appThemeTitle")} desc={t("settings.appThemeDesc")}>
+        <Segmented<Mode>
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: "light", label: t("settings.themeLight"), icon: "sun" },
+            { value: "dark", label: t("settings.themeDark"), icon: "moon" },
+            { value: "auto", label: t("settings.themeAuto"), icon: "refresh" },
+          ]}
+        />
+      </SettingRow>
+      <SettingRow title={t("settings.languageLabel")} desc={t("settings.languageDesc")}>
+        <select
+          value={currentLang()}
+          onChange={(e) => setLang(e.target.value as Lang)}
+          style={{ ...inputStyle(p), width: "auto", appearance: "none", cursor: "pointer" }}
+        >
+          {LANGS.map((l) => (
+            <option key={l} value={l}>
+              {LANG_LABELS[l]}
+            </option>
+          ))}
+        </select>
+      </SettingRow>
+      {family === "nebula" && (
+        <SettingRow title={t("settings.accentTitle")} desc={t("settings.accentDesc")}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: rem(8) }}>
+            <Btn
+              variant="ghost"
+              size="sm"
+              icon={customizeOpen ? "cd" : "cr"}
+              onClick={() => setCustomizeOpen((o) => !o)}
+            >
+              {t("settings.customize")}
+            </Btn>
+            {customizeOpen && (
+              <div style={{ display: "flex", gap: rem(9) }}>
+                {ACCENT_KEYS.map((key) => {
+                  const c = ACCENTS[key].accent;
+                  const on = accent === key;
+                  return (
+                    <button
+                      key={key}
+                      onClick={() => setAccent(key)}
+                      style={{
+                        width: rem(30),
+                        height: rem(30),
+                        borderRadius: "50%",
+                        background: c,
+                        cursor: "pointer",
+                        border: on ? `2px solid ${p.txt}` : "2px solid transparent",
+                        boxShadow: on ? `0 0 0 2px ${p.bg0}, 0 0 0 4px ${c}` : "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                      }}
+                    >
+                      {on && <Icon name="check" size={15} color="#fff" stroke={3} />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </SettingRow>
+      )}
+      {/* Desktop only: a phone already scales through the OS, and the mobile shell
+          is not migrated to `rem`, so offering the control there would move the
+          shared primitives and leave everything around them where it was. */}
+      {!isPhone && (
+        <SettingRow title={t("settings.uiScaleTitle")} desc={t("settings.uiScaleDesc")}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: rem(8) }}>
+            <Segmented<string>
+              value={String(uiScale)}
+              onChange={(v) => setUiScale(sanitizeUiScale(v))}
+              options={UI_SCALES.map((v) => ({ value: String(v), label: `${v}%` }))}
+            />
+            {/* No sample line: the pane the user is reading is already AT the new
+                scale, so the preview said the same thing twice and only competed
+                with the control for the row's width. */}
+            {uiScale !== DEFAULT_UI_SCALE && (
+              <Btn variant="ghost" size="sm" onClick={() => setUiScale(DEFAULT_UI_SCALE)}>
+                {t("settings.uiScaleReset")}
+              </Btn>
+            )}
+          </div>
+        </SettingRow>
+      )}
+      <SettingRow title={t("settings.densityTitle")} desc={t("settings.densityDesc")}>
+        <Segmented<Density>
+          value={density}
+          onChange={setDensity}
+          options={[
+            { value: "comfortable", label: t("settings.densityComfortable") },
+            { value: "compact", label: t("settings.densityCompact") },
+          ]}
+        />
+      </SettingRow>
+      <SettingRow title={t("settings.hostsLayoutTitle")} desc={t("settings.hostsLayoutDesc")}>
+        <Segmented<HostsLayout>
+          value={hostsLayout}
+          onChange={setHostsLayout}
+          options={[
+            { value: "cards", label: t("settings.hostsLayoutCards"), icon: "grid" },
+            { value: "list", label: t("settings.hostsLayoutList"), icon: "list" },
+          ]}
+        />
+      </SettingRow>
+
+      {/* Linux and Windows desktops. A phone window has no frame to hand anywhere;
+          macOS has one it must keep, because the traffic lights are drawn by the
+          OS on top of our bar and it is our bar that reserves their strip —
+          turning it off there leaves them floating over content, and the runtime
+          decoration call that would compensate instead strips the window bare.
+          On Linux, until this is touched the answer comes from the window
+          manager on every boot; the first toggle freezes it to a choice. */}
+      {!isPhone && (osPlatform() === "linux" || osPlatform() === "windows") && (
+        <SettingRow title={t("settings.customChromeTitle")} desc={t("settings.customChromeDesc")}>
+          <Toggle checked={customChrome} onChange={setCustomChrome} />
+        </SettingRow>
+      )}
+      {/* Right beside it, and gone with it: with the system frame on there are no
+          buttons of ours left to place. */}
+      {!isPhone && controls.kind === "custom" && (
+        <SettingRow
+          title={t("settings.windowControlsTitle")}
+          desc={t("settings.windowControlsDesc")}
+        >
+          <Segmented<ControlsSide>
+            value={controls.side}
+            onChange={setWindowControlsSide}
+            options={[
+              { value: "left", label: t("settings.windowControlsLeft") },
+              { value: "right", label: t("settings.windowControlsRight") },
+            ]}
+          />
+        </SettingRow>
+      )}
+
+      <SectionLabel>{t("settings.sectionTerminal")}</SectionLabel>
+      {/* device, not window width: a desktop user with a narrow window must not
+          lose the toggle, and a phone already renders on the GPU unconditionally. */}
+      {!isPhone && (
+        <SettingRow title={t("settings.gpuRenderingTitle")} desc={t("settings.gpuRenderingDesc")}>
+          <Toggle checked={gpuRendering} onChange={setGpuRendering} />
+        </SettingRow>
+      )}
+      <SettingRow title={t("settings.terminalImagesTitle")} desc={t("settings.terminalImagesDesc")}>
+        <Toggle checked={terminalImages} onChange={setTerminalImages} />
+      </SettingRow>
+      <SettingRow title={t("settings.termFontTitle")} desc={t("settings.termFontDesc")}>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(8) }}>
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="minus"
+            onClick={() => bumpTermZoom(-1)}
+            title={t("settings.termFontSmaller")}
+          />
+          <span
+            style={{
+              minWidth: rem(52),
+              textAlign: "center",
+              fontFamily: MONO,
+              fontSize: TEXT.base,
+              fontWeight: 700,
+            }}
+          >
+            {(13.5 + termZoom).toFixed(1)}
+          </span>
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="plus"
+            onClick={() => bumpTermZoom(1)}
+            title={t("settings.termFontLarger")}
+          />
+          {termZoom !== 0 && (
+            <Btn variant="ghost" size="sm" onClick={resetTermZoom}>
+              {t("settings.termFontReset")}
+            </Btn>
+          )}
+        </div>
+      </SettingRow>
+
+      <SettingRow title={t("settings.termFontFamilyTitle")} desc={t("settings.termFontFamilyDesc")}>
+        <div style={{ display: "flex", flexDirection: "column", gap: rem(8), alignItems: "flex-end" }}>
+          <select
+            value={termPrefs.fontId}
+            onChange={(e) => setTermPrefs({ fontId: e.target.value as TermFontId })}
+            style={{
+              fontFamily: UI,
+              fontSize: TEXT.base,
+              padding: `${rem(6)} ${rem(10)}`,
+              borderRadius: 8,
+              border: `1px solid ${p.line2}`,
+              background: p.bg2,
+              color: p.txt,
+            }}
+          >
+            {TERM_FONTS.map((f) => (
+              <option key={f.id} value={f.id}>
+                {installedFonts.has(f.id)
+                  ? f.name
+                  : `${f.name} — ${t("settings.termFontNotInstalled")}`}
+              </option>
+            ))}
+            <option value="custom">…</option>
+          </select>
+          {termPrefs.fontId === "custom" && (
+            <input
+              value={termPrefs.fontCustom}
+              onChange={(e) => setTermPrefs({ fontCustom: e.target.value })}
+              placeholder={t("settings.termFontCustomPlaceholder")}
+              style={{
+                fontFamily: MONO,
+                fontSize: TEXT.base,
+                padding: `${rem(6)} ${rem(10)}`,
+                borderRadius: 8,
+                border: `1px solid ${p.line2}`,
+                background: p.bg2,
+                color: p.txt,
+                width: rem(220),
+              }}
+            />
+          )}
+        </div>
+      </SettingRow>
+
+      <SettingRow title={t("settings.termLineHeightTitle")} desc={t("settings.termLineHeightDesc")}>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+          <input
+            type="range"
+            min={1}
+            max={1.6}
+            step={0.05}
+            value={termPrefs.lineHeight}
+            onChange={(e) => setTermPrefs({ lineHeight: parseFloat(e.target.value) })}
+            style={{ width: rem(150) }}
+          />
+          <span style={{ fontFamily: MONO, fontSize: TEXT.small, minWidth: rem(34), textAlign: "right" }}>
+            {termPrefs.lineHeight.toFixed(2)}
+          </span>
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        title={t("settings.termLetterSpacingTitle")}
+        desc={t("settings.termLetterSpacingDesc")}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+          <input
+            type="range"
+            min={-1}
+            max={2}
+            step={0.25}
+            value={termPrefs.letterSpacing}
+            onChange={(e) => setTermPrefs({ letterSpacing: parseFloat(e.target.value) })}
+            style={{ width: rem(150) }}
+          />
+          <span style={{ fontFamily: MONO, fontSize: TEXT.small, minWidth: rem(34), textAlign: "right" }}>
+            {termPrefs.letterSpacing.toFixed(2)}
+          </span>
+        </div>
+      </SettingRow>
+
+      <SettingRow title={t("settings.termCursorTitle")}>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(12), flexWrap: "wrap" }}>
+          <Segmented<TermCursorStyle>
+            value={termPrefs.cursor}
+            onChange={(v) => setTermPrefs({ cursor: v })}
+            options={[
+              { value: "block", label: t("settings.termCursorBlock") },
+              { value: "bar", label: t("settings.termCursorBar") },
+              { value: "underline", label: t("settings.termCursorUnderline") },
+            ]}
+          />
+          <label style={{ display: "flex", alignItems: "center", gap: rem(8), fontSize: TEXT.base }}>
+            <Toggle
+              checked={termPrefs.cursorBlink}
+              onChange={(v) => setTermPrefs({ cursorBlink: v })}
+              aria-label={t("settings.termCursorBlink")}
+            />
+            {t("settings.termCursorBlink")}
+          </label>
+        </div>
+      </SettingRow>
+
+      <SettingRow title={t("settings.termFgTitle")} desc={t("settings.termFgDesc")}>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+          <input
+            type="color"
+            value={toHexInput(termPrefs.fg ?? termTheme.fg)}
+            onChange={(e) => setTermPrefs({ fg: e.target.value })}
+            aria-label={t("settings.termFgTitle")}
+            style={{ width: rem(36), height: rem(28), padding: 0, border: "none", background: "none" }}
+          />
+          {termPrefs.fg && (
+            <Btn variant="ghost" size="sm" onClick={() => setTermPrefs({ fg: null })}>
+              {t("settings.termFgReset")}
+            </Btn>
+          )}
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        title={t("settings.termMinContrastTitle")}
+        desc={t("settings.termMinContrastDesc")}
+      >
+        <Toggle
+          checked={termPrefs.minContrast}
+          onChange={(v) => setTermPrefs({ minContrast: v })}
+          aria-label={t("settings.termMinContrastTitle")}
+        />
+      </SettingRow>
+
+      {/* A number box rather than a slider: there is no ceiling to slide to, and someone
+          who wants 200 000 rows should be able to say so instead of dragging to a stop we
+          invented. The estimate below carries what the missing ceiling used to. */}
+      <SettingRow title={t("settings.termScrollbackTitle")} desc={t("settings.termScrollbackDesc")}>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(10), flexWrap: "wrap" }}>
+          <input
+            type="number"
+            min={TERM_SCROLLBACK_MIN}
+            max={TERM_SCROLLBACK_LIMIT}
+            step={TERM_SCROLLBACK_STEP}
+            value={termPrefs.scrollback}
+            onChange={(e) => {
+              // Empty box / mid-edit garbage must not reach xterm: a NaN here throws in the
+              // option setter and takes the pane with it. Keep the last good value instead.
+              const n = parseInt(e.target.value, 10);
+              if (!Number.isFinite(n)) return;
+              setTermPrefs({
+                scrollback: Math.min(TERM_SCROLLBACK_LIMIT, Math.max(TERM_SCROLLBACK_MIN, n)),
+              });
+            }}
+            aria-label={t("settings.termScrollbackTitle")}
+            style={{
+              fontFamily: MONO,
+              fontSize: TEXT.base,
+              padding: `${rem(6)} ${rem(10)}`,
+              borderRadius: 8,
+              border: `1px solid ${p.line2}`,
+              background: p.bg2,
+              color: p.txt,
+              width: rem(110),
+            }}
+          />
+          <span style={{ fontSize: TEXT.small, color: p.txt3 }}>
+            {t("settings.termScrollbackEstimate", {
+              size: fmtSize(termScrollbackBytes(termPrefs.scrollback)),
+            })}
+          </span>
+        </div>
+      </SettingRow>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", padding: `${rem(12)} 0` }}>
+        <Btn variant="ghost" size="sm" icon="refresh" onClick={resetTermPrefs}>
+          {t("settings.termResetPrefs")}
+        </Btn>
+      </div>
+
+      <SectionLabel>{t("settings.termPreviewLabel")}</SectionLabel>
+      <div style={{ padding: `${rem(4)} 0 0` }}>
+        <TerminalPreview />
+      </div>
+      <div style={{ padding: `${rem(16)} 0` }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: rem(12),
+            marginBottom: rem(14),
+            flexWrap: "wrap", // let the reset Btn drop below the title on a narrow window
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: TEXT.body, fontWeight: 700, marginBottom: rem(3) }}>
+              {t("settings.termThemeTitle")}
+            </div>
+            <div style={{ fontSize: TEXT.base, color: p.txt3 }}>{t("settings.termThemeDesc")}</div>
+          </div>
+          <Btn variant="ghost" size="sm" icon="refresh" onClick={resetTermTheme}>
+            {t("settings.termResetDefault")}
+          </Btn>
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: isMobile
+              ? `repeat(auto-fill, minmax(${rem(150)}, 1fr))`
+              : "repeat(4, 1fr)",
+            gap: rem(10),
+          }}
+        >
+          {visibleThemes.map((th) => {
+            const active = th.id === termThemeId;
+            const isCustom = customIds.has(th.id);
+            return (
+              <div key={th.id} style={{ position: "relative" }}>
+                <button
+                  onClick={() => setTermThemeId(th.id)}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    padding: 0,
+                    borderRadius: 12,
+                    overflow: "hidden",
+                    cursor: "pointer",
+                    border: `1px solid ${active ? p.accentLine : p.line}`,
+                    background: th.bg,
+                    boxShadow: active ? `0 0 0 3px ${p.accentSoft}` : "none",
+                  }}
+                >
+                  <div style={{ padding: `${rem(10)} ${rem(12)}`, fontFamily: MONO, fontSize: TEXT.micro, lineHeight: 1.5 }}>
+                    <div>
+                      <span style={{ color: th.green }}>$</span>{" "}
+                      <span style={{ color: th.fg }}>ssh</span>{" "}
+                      <span style={{ color: th.blue }}>web-01</span>
+                    </div>
+                    <div>
+                      <span style={{ color: th.purple }}>git</span>{" "}
+                      <span style={{ color: th.fg }}>push</span>{" "}
+                      <span style={{ color: th.red }}>--force</span>
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: rem(6),
+                      padding: `${rem(7)} ${rem(12)}`,
+                      background: "rgba(0,0,0,0.25)",
+                    }}
+                  >
+                    <span style={{ fontSize: TEXT.small, fontWeight: 700, color: "#fff", flex: 1 }}>
+                      {th.name}
+                    </span>
+                    {active && <Icon name="check" size={13} color="#fff" />}
+                  </div>
+                </button>
+                {isCustom && (
+                  <div style={{ position: "absolute", top: rem(6), right: rem(6), display: "flex", gap: rem(4) }}>
+                    <ThemeCardAction
+                      icon="pencil"
+                      label={t("termtheme.editTitle")}
+                      onClick={() => openModal({ kind: "termtheme", edit: th })}
+                    />
+                    <ThemeCardAction
+                      icon="trash"
+                      label={t("termtheme.delete")}
+                      onClick={() => confirmDeleteTheme(th)}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <button
+            onClick={() => openModal({ kind: "termtheme" })}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: rem(6),
+              borderRadius: 12,
+              cursor: "pointer",
+              border: `1px solid ${p.line}`,
+              background: "transparent",
+              color: p.txt3,
+              minHeight: rem(86),
+            }}
+          >
+            <Icon name="plus" size={18} />
+            <span style={{ fontSize: TEXT.small, fontWeight: 600 }}>{t("settings.customTheme")}</span>
+          </button>
+        </div>
+        {!showAllThemes && orderedThemes.length > 8 && (
+          <div style={{ marginTop: rem(12) }}>
+            <Btn variant="ghost" size="sm" onClick={() => setShowAllThemes(true)}>
+              {t("settings.termShowAllThemes", { n: orderedThemes.length })}
+            </Btn>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ── General ────────────────────────────────────────────────────
+type AutoLock = "5" | "15" | "60" | "never";
+/** Seconds of grace on an OS screen lock, or "off". Mirrors `osLockGrace`. */
+type OsLock = "off" | "0" | "30" | "60" | "300";
+type Startup = "locked" | "unlocked";
+
+function SettingsGeneral() {
+  const [lock, setLock] = useState<AutoLock>(() => lsGet("unissh.autolock", "15") as AutoLock);
+  const [startup, setStartup] = useState<Startup>(
+    () => lsGet("unissh.startup", "unlocked") as Startup,
+  );
+  const [confirmQuit, setConfirmQuit] = useState<boolean>(
+    () => lsGet("unissh.confirmquit", "1") === "1",
+  );
+  const autoReconnect = useApp((s) => s.autoReconnect);
+  const setAutoReconnect = useApp((s) => s.setAutoReconnect);
+  const keepaliveSecs = useApp((s) => s.keepaliveSecs);
+  const setKeepaliveSecs = useApp((s) => s.setKeepaliveSecs);
+  const modernAlgorithms = useApp((s) => s.modernAlgorithms);
+  const setModernAlgorithms = useApp((s) => s.setModernAlgorithms);
+  const sftpParallelism = useApp((s) => s.sftpParallelism);
+  const sftpExternalEditDefault = useApp((s) => s.sftpExternalEditDefault);
+  const setSftpExternalEditDefault = useApp((s) => s.setSftpExternalEditDefault);
+  const setSftpParallelism = useApp((s) => s.setSftpParallelism);
+  const osLockGrace = useApp((s) => s.osLockGrace);
+  const setOsLockGrace = useApp((s) => s.setOsLockGrace);
+  const isMobile = useIsMobile();
+
+  // Master-password instances can't auto-unlock at startup (the password is
+  // stored nowhere), so gate the "start unlocked" option honestly. Treat the
+  // unknown state (null — no readable keyset) as "disabled" too: boot()'s
+  // auto-unlock gate is a strict `requiresPassword === false`, so anything that
+  // isn't a definite "passwordless" must not advertise the feature as working.
+  const requiresPassword = useApp((s) => s.requiresPassword);
+  const startupDisabled = requiresPassword !== false;
+
+  const onLock = (v: AutoLock) => {
+    setLock(v);
+    lsSet("unissh.autolock", v);
+    // Push to the store too so the idle timer re-arms live (no restart needed).
+    useApp.getState().setAutolockMin(v === "never" ? null : parseInt(v, 10));
+  };
+  const onStartup = (v: Startup) => {
+    setStartup(v);
+    lsSet("unissh.startup", v);
+  };
+  const onConfirmQuit = (v: boolean) => {
+    setConfirmQuit(v);
+    lsSet("unissh.confirmquit", v ? "1" : "0");
+  };
+
+  const { t } = useTranslation();
+
+  const openLogs = async () => {
+    await guard(async () => {
+      await api.revealLogDir();
+    });
+  };
+  const copyDiagnostics = async () => {
+    await guard(async () => {
+      const [dir, appVer] = await Promise.all([
+        api.logDir().catch(() => "?"),
+        getVersion().catch(() => "?"),
+      ]);
+      let plat = "?";
+      let osv = "?";
+      try {
+        plat = platform();
+        osv = osVersion();
+      } catch {
+        /* not in a Tauri context */
+      }
+      await writeText(`Remora ${appVer}\nOS: ${plat} ${osv}\nLogs: ${dir}`);
+      toast(t("settings.diagnosticsCopied"), "ok");
+    });
+  };
+
+  return (
+    <>
+      <SectionLabel first>{t("settings.sectionLock")}</SectionLabel>
+      <SettingRow title={t("settings.autoLockTitle")} desc={t("settings.autoLockDesc")}>
+        <Segmented<AutoLock>
+          value={lock}
+          onChange={onLock}
+          options={[
+            { value: "5", label: t("settings.lock5min") },
+            { value: "15", label: t("settings.lock15min") },
+            { value: "60", label: t("settings.lock1hour") },
+            { value: "never", label: t("settings.lockNever") },
+          ]}
+        />
+      </SettingRow>
+      {/* Desktop only: nothing on a phone emits a session-lock or suspend signal
+          for this to follow, and app backgrounding is a separate question this
+          setting does not answer. */}
+      {!isMobile && (
+        <SettingRow title={t("settings.osLockTitle")} desc={t("settings.osLockDesc")}>
+          <Segmented<OsLock>
+            value={osLockGrace === null ? "off" : (String(osLockGrace) as OsLock)}
+            onChange={(v) => setOsLockGrace(v === "off" ? null : parseInt(v, 10))}
+            options={[
+              { value: "off", label: t("settings.osLockOff") },
+              { value: "0", label: t("settings.osLockNow") },
+              { value: "30", label: t("settings.osLockSec", { n: 30 }) },
+              { value: "60", label: t("settings.osLockMin", { n: 1 }) },
+              { value: "300", label: t("settings.osLockMin", { n: 5 }) },
+            ]}
+          />
+        </SettingRow>
+      )}
+      <SettingRow
+        title={t("settings.startupTitle")}
+        desc={startupDisabled ? t("settings.startupPwNote") : t("settings.startupDesc")}
+      >
+        <Segmented<Startup>
+          value={startupDisabled ? "locked" : startup}
+          onChange={onStartup}
+          disabled={startupDisabled}
+          options={[
+            { value: "locked", label: t("settings.startupLocked") },
+            { value: "unlocked", label: t("settings.startupUnlocked") },
+          ]}
+        />
+      </SettingRow>
+
+      <SectionLabel>{t("settings.sectionConnection")}</SectionLabel>
+      <SettingRow title={t("settings.autoReconnectTitle")} desc={t("settings.autoReconnectDesc")}>
+        <Toggle checked={autoReconnect} onChange={setAutoReconnect} />
+      </SettingRow>
+      <SettingRow
+        title={t("settings.modernAlgorithmsTitle")}
+        desc={t("settings.modernAlgorithmsDesc")}
+      >
+        <Toggle checked={modernAlgorithms} onChange={setModernAlgorithms} />
+      </SettingRow>
+      <SettingRow title={t("settings.keepaliveTitle")} desc={t("settings.keepaliveDesc")}>
+        <Segmented<string>
+          value={String(keepaliveSecs)}
+          onChange={(v) => setKeepaliveSecs(parseInt(v, 10) || 0)}
+          options={[
+            { value: "0", label: t("settings.keepaliveOff") },
+            { value: "15", label: t("settings.keepaliveSec", { n: 15 }) },
+            { value: "30", label: t("settings.keepaliveSec", { n: 30 }) },
+            { value: "60", label: t("settings.keepaliveSec", { n: 60 }) },
+          ]}
+        />
+      </SettingRow>
+      {/* Desktop only: there is no external editor to hand a file to on a phone,
+          and the SFTP pane there offers the in-app one regardless. */}
+      {!isMobile && (
+        <SettingRow
+          title={t("settings.sftpExternalEditTitle")}
+          desc={t("settings.sftpExternalEditDesc")}
+        >
+          <Toggle checked={sftpExternalEditDefault} onChange={setSftpExternalEditDefault} />
+        </SettingRow>
+      )}
+      <SettingRow
+        title={t("settings.sftpParallelismTitle")}
+        desc={t("settings.sftpParallelismDesc")}
+      >
+        <Segmented<string>
+          value={String(sftpParallelism)}
+          onChange={(v) => setSftpParallelism(parseInt(v, 10) || 1)}
+          options={[
+            { value: "1", label: t("settings.sftpParallelismOff") },
+            { value: "2", label: "2" },
+            { value: "4", label: "4" },
+            { value: "8", label: "8" },
+          ]}
+        />
+      </SettingRow>
+
+      {/* Desktop-only, like the feature: the mobile shell has no local terminal
+          to configure, and settings for something that cannot exist are noise. */}
+      {!isMobile && <SettingsLocalTerminal />}
+
+      <SectionLabel>{t("settings.sectionBehavior")}</SectionLabel>
+      <SettingRow title={t("settings.confirmQuitTitle")} desc={t("settings.confirmQuitDesc")}>
+        <Toggle checked={confirmQuit} onChange={onConfirmQuit} />
+      </SettingRow>
+
+      <SectionLabel>{t("settings.sectionDiagnostics")}</SectionLabel>
+      <SettingRow title={t("settings.logsTitle")} desc={t("settings.logsDesc")}>
+        {/* wrap so the two long RU labels can stack instead of overflowing */}
+        <div style={{ display: "flex", gap: rem(8), flexWrap: "wrap" }}>
+          <Btn variant="ghost" icon="folder" onClick={openLogs}>
+            {t("settings.openLogFolder")}
+          </Btn>
+          <Btn variant="ghost" icon="copy" onClick={copyDiagnostics}>
+            {t("settings.copyDiagnostics")}
+          </Btn>
+        </div>
+      </SettingRow>
+    </>
+  );
+}
+
+// ── Local terminal ─────────────────────────────────────────────
+//
+// These four live in localStorage, not the vault: a shell path is a fact about
+// one machine, and syncing "/opt/homebrew/bin/fish" to a Windows laptop would be
+// worse than useless. Read once per pane, so editing them never rewrites what a
+// running pane is doing — the next terminal you open picks them up.
+function SettingsLocalTerminal() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const vaults = useApp((s) => s.vaults);
+  const vaultId = useApp((s) => s.vaultId);
+  const machine = useLocalMachine();
+  const [shell, setShell] = useState(() => localShellSettings().shell);
+  const [args, setArgs] = useState(() => localShellSettings().args);
+  const [cwd, setCwd] = useState(() => localShellSettings().cwd);
+  const [record, setRecord] = useState(() => localShellSettings().record);
+  // Whether the argument string parses. Checked by the same splitter that will
+  // run at open time, so the warning can't disagree with the behaviour.
+  const [argsOk, setArgsOk] = useState(true);
+  const [personalVault, setPersonalVault] = useState<string | null>(null);
+
+  // Re-read whenever the vault list changes: moving the Personal vault to a
+  // server gives it a new id (the core re-points the pointer), and the move
+  // ends with a vault-list refresh.
+  useEffect(() => {
+    let alive = true;
+    api
+      .getPersonalVault()
+      .then((v) => {
+        if (alive) setPersonalVault(v);
+      })
+      .catch(() => {
+        /* no personal vault configured; the shared-vault note applies */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [vaults]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!args.trim()) {
+      setArgsOk(true);
+      return;
+    }
+    api
+      .localShellSplitArgs(args)
+      .then((parsed) => {
+        if (alive) setArgsOk(parsed !== null);
+      })
+      .catch(() => {
+        /* leave the last verdict rather than flag a valid string on an IPC blip */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [args]);
+
+  const onShell = (v: string) => {
+    setShell(v);
+    setLocalShellSetting("shell", v);
+  };
+  const onArgs = (v: string) => {
+    setArgs(v);
+    setLocalShellSetting("args", v);
+  };
+  const onCwd = (v: string) => {
+    setCwd(v);
+    setLocalShellSetting("cwd", v);
+  };
+  const onRecord = (v: boolean) => {
+    setRecord(v);
+    setLocalShellSetting("record", v ? "1" : "0");
+  };
+
+  // Name the vault a recording would actually land in. The toggle is not
+  // blocked either way — it is the user's machine and their choice — but which
+  // vault it syncs to is not something to discover afterwards.
+  // The vault may not be in the list yet (a reload in flight). Naming it by id
+  // is less useful than naming it by name, but a sentence with a blank where the
+  // vault should be is worse than either.
+  const selectedVaultName = vaults.find((v) => v.vaultId === vaultId)?.name || vaultId;
+  const recordNote = personalVault
+    ? t("settings.localRecordVaultPersonal")
+    : selectedVaultName
+      ? t("settings.localRecordVaultShared", { vault: selectedVaultName })
+      : t("settings.localRecordVaultNone");
+
+  return (
+    <>
+      <SectionLabel>{t("settings.sectionLocalTerminal")}</SectionLabel>
+      <SettingRow title={t("settings.localShellTitle")} desc={t("settings.localShellDesc")}>
+        <input
+          value={shell}
+          onChange={(e) => onShell(e.target.value)}
+          placeholder={
+            machine ? t("settings.localShellAuto", { program: machine.program }) : undefined
+          }
+          {...NO_AUTOCORRECT}
+          style={{ ...inputStyle(p, true), maxWidth: rem(340) }}
+        />
+      </SettingRow>
+      <SettingRow
+        title={t("settings.localArgsTitle")}
+        desc={argsOk ? t("settings.localArgsDesc") : t("settings.localArgsInvalid")}
+      >
+        <input
+          value={args}
+          onChange={(e) => onArgs(e.target.value)}
+          placeholder={
+            machine
+              ? machine.args.length
+                ? t("settings.localArgsAuto", { args: machine.args.join(" ") })
+                : t("settings.localArgsAutoNone")
+              : undefined
+          }
+          {...NO_AUTOCORRECT}
+          style={{
+            ...inputStyle(p, true),
+            maxWidth: rem(340),
+            borderColor: argsOk ? p.line2 : p.red,
+          }}
+        />
+      </SettingRow>
+      <SettingRow title={t("settings.localCwdTitle")} desc={t("settings.localCwdDesc")}>
+        <input
+          value={cwd}
+          onChange={(e) => onCwd(e.target.value)}
+          placeholder={t("settings.localCwdAuto")}
+          {...NO_AUTOCORRECT}
+          style={{ ...inputStyle(p, true), maxWidth: rem(340) }}
+        />
+      </SettingRow>
+      <SettingRow
+        title={t("settings.localRecordTitle")}
+        desc={`${t("settings.localRecordDesc")} ${recordNote}`}
+      >
+        <Toggle checked={record} onChange={onRecord} />
+      </SettingRow>
+      <div style={{ fontSize: TEXT.small, color: p.txt3, marginTop: rem(12) }}>
+        {t("settings.localLockNote")}
+      </div>
+    </>
+  );
+}
+
+// ── Security ───────────────────────────────────────────────────
+function ChangePasswordForm({
+  onClose,
+  onChanged,
+}: {
+  onClose: () => void;
+  /** After a successful change; `biometricWiped` when biometric unlock was on
+   *  and has been turned off (its stored password belonged to the old one). */
+  onChanged: (biometricWiped: boolean) => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const wipe = await api.changePassword(
+        oldPw ? oldPw : null,
+        newPw ? newPw : null,
+        secretKey.replace(/[\s-]/g, ""),
+      );
+      // Keep the startup gating honest: adding/removing the master password flips
+      // whether "start unlocked" can ever apply.
+      useApp.setState({ requiresPassword: !!newPw });
+      toast(t("settings.masterPwChanged"), "ok");
+      // Never "erased" when it was not: what is left opens nothing any more
+      // (the core refuses the old password) and goes at the next attempt.
+      if (wipe === "failed") toast(t("settings.biometricWipeFailed", { method: biometricMethod() }), "warn");
+      onChanged(wipe === "erased");
+      onClose();
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      style={{
+        marginTop: rem(12),
+        padding: rem(16),
+        borderRadius: 12,
+        border: `1px solid ${p.line2}`,
+        background: p.bg1,
+        display: "flex",
+        flexDirection: "column",
+        gap: rem(11),
+      }}
+    >
+      <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("settings.changeMasterPw")}</div>
+      <input
+        {...NO_AUTOCORRECT}
+        type="password"
+        value={oldPw}
+        onChange={(e) => setOldPw(e.target.value)}
+        placeholder={t("settings.currentPwPlaceholder")}
+        style={inputStyle(p)}
+      />
+      <input
+        {...NO_AUTOCORRECT}
+        type="password"
+        value={newPw}
+        onChange={(e) => setNewPw(e.target.value)}
+        placeholder={t("settings.newPwPlaceholder")}
+        style={inputStyle(p)}
+      />
+      <input
+        {...NO_AUTOCORRECT}
+        type="password"
+        value={secretKey}
+        onChange={(e) => setSecretKey(e.target.value)}
+        placeholder={t("settings.secretKeyPlaceholder")}
+        style={inputStyle(p, true)}
+      />
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn size="sm" icon="check" onClick={submit} disabled={busy}>
+          {t("common.save")}
+        </Btn>
+      </div>
+    </form>
+  );
+}
+
+/** "Unlock with Touch ID" / "Unlock with Windows Hello". Only for a password
+ *  vault (a Secret-Key-only vault has no password to remember; it gets
+ *  `PresenceGateRow` instead). On a Mac it is offered only where Touch ID can
+ *  be used (an unsigned build may never get there, so it is hidden rather than
+ *  promised); on Windows it is always shown, and without Windows Hello set up
+ *  it is disabled with that reason.
+ *  Turning it on asks for the master password once — Rust checks it against the
+ *  keyset before storing anything, so enabling proves the password is held.
+ *  Turning it off erases the stored password and its device secret at once.
+ *  An invalidated one (fingerprints changed, Hello reset) stays visible, to say
+ *  so and to be turned on again; so does one turned off by a password change
+ *  (`reenable`). A stranded one (stored, but the platform cannot use it now)
+ *  shows as off with the reason and a button to forget what is stored.
+ *  Biometric unlock stores only the password, so it depends on the Secret Key
+ *  being remembered on this device; without it the row says so and cannot be
+ *  switched on. */
+function BiometricRow({ reenable }: { reenable: boolean }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const requiresPassword = useApp((s) => s.requiresPassword);
+  const [status, setStatus] = useState<BiometricStatus | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [pw, setPw] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = () =>
+    api
+      .biometricStatus(true)
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  const offered = isMac() || isWindows();
+  // Only a password vault has this row; a keychain read for any other is waste.
+  useEffect(() => {
+    if (offered && requiresPassword === true) void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the platform does not change
+  }, [requiresPassword]);
+
+  if (!offered || requiresPassword !== true || !status) return null;
+  const win = isWindows();
+  const method = biometricMethod();
+  const unusable = !status.supported && !status.enabled && !status.invalidated && !status.stranded;
+  if (unusable && !win) return null;
+
+  const turnOff = async () => {
+    setBusy(true);
+    await guard(async () => {
+      await api.biometricDisable();
+      toast(t("settings.biometricOff", { method }), "ok");
+    });
+    await refresh();
+    setBusy(false);
+  };
+
+  const turnOn = async () => {
+    if (busy || !pw) return;
+    setBusy(true);
+    try {
+      await api.biometricEnable(pw);
+      setPw("");
+      setConfirming(false);
+      toast(t("settings.biometricOn", { method }), "ok");
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    }
+    await refresh();
+    setBusy(false);
+  };
+
+  return (
+    <>
+      <SettingRow
+        title={t("settings.biometricTitle", { method })}
+        desc={
+          status.stranded
+            ? t(win ? "settings.biometricStrandedWindows" : "settings.biometricStranded")
+            : unusable
+            ? t("settings.biometricUnsupportedWindows")
+            : reenable && !status.enabled
+              ? t("settings.biometricReenable", { method })
+            : !status.secretKeyRemembered
+              ? t(status.enabled ? "settings.biometricNeedsSecretKeyOn" : "settings.biometricNeedsSecretKey", {
+                  method,
+                })
+              : status.invalidated
+                ? t(win ? "settings.biometricInvalidatedWindows" : "settings.biometricInvalidated")
+                : t(win ? "settings.biometricDescWindows" : "settings.biometricDesc")
+        }
+      >
+        {status.stranded ? (
+          // Off, and cannot be turned on here now; what is stored can go.
+          <Btn variant="ghost" size="sm" icon="trash" onClick={turnOff} disabled={busy}>
+            {t("settings.biometricForget")}
+          </Btn>
+        ) : (
+          <Toggle
+            checked={status.enabled || confirming}
+            // Turning it on needs the remembered Secret Key; turning it off never does.
+            disabled={!status.secretKeyRemembered && !status.enabled}
+            onChange={(v) => {
+              if (busy) return;
+              if (v) setConfirming(true);
+              else if (confirming && !status.enabled) setConfirming(false);
+              else void turnOff();
+            }}
+          />
+        )}
+      </SettingRow>
+      {confirming && !status.enabled && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void turnOn();
+          }}
+          style={{
+            marginTop: rem(12),
+            padding: rem(16),
+            borderRadius: 12,
+            border: `1px solid ${p.line2}`,
+            background: p.bg1,
+            display: "flex",
+            flexDirection: "column",
+            gap: rem(11),
+          }}
+        >
+          <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("settings.biometricConfirm", { method })}</div>
+          <input
+            {...NO_AUTOCORRECT}
+            type="password"
+            autoFocus
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            placeholder={t("settings.biometricPwPlaceholder")}
+            style={inputStyle(p)}
+          />
+          <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+            <Btn
+              variant="ghost"
+              size="sm"
+              type="button"
+              onClick={() => {
+                setPw("");
+                setConfirming(false);
+              }}
+              disabled={busy}
+            >
+              {t("common.cancel")}
+            </Btn>
+            <Btn size="sm" icon="fingerprint" type="submit" disabled={busy || !pw}>
+              {t("settings.biometricTurnOn")}
+            </Btn>
+          </div>
+        </form>
+      )}
+    </>
+  );
+}
+
+/** "Require Touch ID / Windows Hello at startup", for a Secret-Key-only vault
+ *  on a device that remembers its Secret Key — which otherwise opens with no
+ *  check at all. On, the remembered key is used only after the platform's
+ *  presence prompt; dismissed, the vault stays locked and the Secret Key can
+ *  still be typed from the Emergency Kit. Nothing is stored behind the prompt,
+ *  so turning it on or off needs no password. Turning it on shows the prompt
+ *  once and saves the setting only if it confirmed — a prompt that never works
+ *  on this machine must not be what stands between the user and the vault.
+ *  Turning it off is free. Shown where the prompt can be shown, and wherever it
+ *  is on (so it can always be turned off). */
+function PresenceGateRow() {
+  const { t } = useTranslation();
+  const requiresPassword = useApp((s) => s.requiresPassword);
+  const on = useApp((s) => s.presenceGate);
+  const setOn = useApp((s) => s.setPresenceGate);
+  const [status, setStatus] = useState<BiometricStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const offered = isMac() || isWindows();
+  // Only a Secret-Key-only vault has this row; a keychain read for any other is waste.
+  useEffect(() => {
+    if (offered && requiresPassword === false)
+      void api
+        .biometricStatus(true)
+        .then(setStatus)
+        .catch(() => setStatus(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the platform does not change
+  }, [requiresPassword]);
+
+  if (!offered || requiresPassword !== false || !status) return null;
+  if (!status.presenceSupported && !on) return null;
+  const method = biometricMethod();
+
+  const turnOn = async () => {
+    setBusy(true);
+    try {
+      const check = await api.biometricConfirmPresence(
+        t(isWindows() ? "settings.presenceGateReasonWindows" : "settings.presenceGateReason"),
+      );
+      if (check === "confirmed") setOn(true);
+      else
+        toast(
+          t(check === "cancelled" ? "settings.presenceGateNotConfirmed" : "settings.presenceGateCannotPrompt", {
+            method,
+          }),
+          "warn",
+        );
+    } catch (e) {
+      toast(t("settings.presenceGateFailed", { method, error: apiErrorMessage(e) }), "err");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <SettingRow
+      title={t("settings.presenceGateTitle", { method })}
+      desc={
+        !status.presenceSupported
+          ? t("settings.presenceGateUnavailable", { method })
+          : !status.secretKeyRemembered
+            ? t(on ? "settings.presenceGateNeedsSecretKeyOn" : "settings.presenceGateNeedsSecretKey")
+            : t("settings.presenceGateDesc", { method })
+      }
+    >
+      <Toggle
+        checked={on}
+        // Turning it off is always allowed; on only where it can be proven.
+        disabled={busy || (!on && (!status.presenceSupported || !status.secretKeyRemembered))}
+        onChange={(v) => {
+          if (busy) return;
+          if (v) void turnOn();
+          else setOn(false);
+        }}
+      />
+    </SettingRow>
+  );
+}
+
+function SettingsSecurity() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const knownHosts = useApp((s) => s.knownHosts);
+  const [changing, setChanging] = useState(false);
+  // Biometric unlock is wiped by a password change; the row then asks for it
+  // again (and is remounted, so it reads the new status).
+  const [pwChanges, setPwChanges] = useState(0);
+  const [biometricWiped, setBiometricWiped] = useState(false);
+  // Same slot-and-dialog shape as the per-vault integrity check. This was left on
+  // a toast when that one moved off it, which meant the answer to "is my database
+  // sound" still vanished in under three seconds and still named a count instead
+  // of the rows it had just found.
+  const [consistency, setConsistency] = useState<DbConsistencyReport | null>(null);
+  const [clip, setClip] = useState<boolean>(() => lsGet("unissh.clipclear", "1") === "1");
+
+  const onClip = (v: boolean) => {
+    setClip(v);
+    lsSet("unissh.clipclear", v ? "1" : "0");
+  };
+  const keyAgeDays = useApp((s) => s.keyAgeDays);
+  const setKeyAgeDays = useApp((s) => s.setKeyAgeDays);
+
+  const checkDbConsistency = async () => {
+    await guard(async () => {
+      setConsistency(await api.checkConsistency());
+    });
+  };
+
+  const clearKnownHosts = () => {
+    ctx.confirm({
+      title: t("settings.clearKnownHostsTitle"),
+      body: t("settings.clearKnownHostsBody"),
+      danger: true,
+      confirmLabel: t("settings.clear"),
+      icon: "trash",
+      onConfirm: async () => {
+        await guard(async () => {
+          const hosts = useApp.getState().knownHosts;
+          for (const h of hosts) {
+            await api.forgetHost(h.host, h.port);
+          }
+          await useApp.getState().reloadVault();
+          toast(t("settings.knownHostsCleared"), "ok");
+        });
+      },
+    });
+  };
+
+  return (
+    <>
+      <SectionLabel first>{t("settings.sectionAccess")}</SectionLabel>
+      <SettingRow title={t("settings.masterPwTitle")} desc={t("settings.masterPwDesc")}>
+        <Btn variant="ghost" size="sm" icon="lock" onClick={() => setChanging((v) => !v)}>
+          {t("settings.change")}
+        </Btn>
+      </SettingRow>
+      {changing && (
+        <ChangePasswordForm
+          onClose={() => setChanging(false)}
+          onChanged={(wiped) => {
+            setBiometricWiped((was) => was || wiped);
+            setPwChanges((n) => n + 1);
+          }}
+        />
+      )}
+      <BiometricRow key={`bio-${pwChanges}`} reenable={biometricWiped} />
+      <PresenceGateRow key={`gate-${pwChanges}`} />
+      <SettingRow title={t("settings.clipClearTitle")} desc={t("settings.clipClearDesc")}>
+        <Toggle checked={clip} onChange={onClip} />
+      </SettingRow>
+      <SettingRow title={t("settings.keyAgeTitle")} desc={t("settings.keyAgeDesc")}>
+        <Segmented<string>
+          value={String(keyAgeDays)}
+          onChange={(v) => setKeyAgeDays(parseInt(v, 10))}
+          options={[
+            { value: "0", label: t("settings.keyAgeOff") },
+            { value: "180", label: t("settings.keyAge180") },
+            { value: "365", label: t("settings.keyAge365") },
+            { value: "730", label: t("settings.keyAge730") },
+          ]}
+        />
+      </SettingRow>
+
+      <SectionLabel>{t("settings.sectionRecovery")}</SectionLabel>
+      <SettingRow title="Emergency Kit" desc={t("settings.emergencyKitDesc")}>
+        <Btn variant="ghost" size="sm" icon="key" onClick={() => ctx.onShowKit()}>
+          {t("common.show")}
+        </Btn>
+      </SettingRow>
+
+      <SectionLabel>{t("settings.sectionMaintenance")}</SectionLabel>
+      <SettingRow
+        title={t("settings.dbConsistencyTitle")}
+        desc={t("settings.dbConsistencyDesc")}
+      >
+        <Btn variant="ghost" size="sm" icon="shieldcheck" onClick={checkDbConsistency}>
+          {t("settings.check")}
+        </Btn>
+      </SettingRow>
+
+      {isDesktopOs() && <SettingsSystemAgent />}
+
+      <div
+        style={{
+          marginTop: rem(26),
+          paddingTop: rem(20),
+          borderTop: `1px solid ${p.line}`,
+        }}
+      >
+        <div style={{ fontSize: TEXT.base, fontWeight: 700, color: p.red, marginBottom: rem(4) }}>
+          {t("settings.dangerZone")}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: rem(12) }}>
+          <div style={{ flex: 1, fontSize: TEXT.base, color: p.txt2 }}>
+            {t("settings.dangerZoneDesc")}
+          </div>
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="trash"
+            onClick={clearKnownHosts}
+            disabled={knownHosts.length === 0}
+            style={{ color: p.red, borderColor: rgba(p.red, 0.4) }}
+          >
+            {t("settings.clear")}
+          </Btn>
+        </div>
+      </div>
+
+      {consistency && (
+        <ConsistencyResult report={consistency} onClose={() => setConsistency(null)} />
+      )}
+    </>
+  );
+}
+
+/** The database consistency answer, kept on screen and itemised.
+ *
+ *  Two different questions in one report, and they are not interchangeable:
+ *  `integrityOk` is SQLite saying the FILE is sound, `issues` are rows that are
+ *  individually well-formed but wrong about each other. A corrupt file needs a
+ *  restore; a stale history row does not, and collapsing both into "found 3
+ *  problems" tells you neither. */
+function ConsistencyResult({
+  report,
+  onClose,
+}: {
+  report: DbConsistencyReport;
+  onClose: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  return (
+    <Modal
+      icon={report.ok ? "shieldcheck" : "alert"}
+      iconColor={report.ok ? p.green : p.red}
+      title={t(report.ok ? "settings.dbConsistencyOkTitle" : "settings.dbConsistencyFailedTitle")}
+      onClose={onClose}
+      w={520}
+      footer={
+        <div style={{ display: "flex", justifyContent: "flex-end", width: "100%" }}>
+          <Btn onClick={onClose}>{t("common.done")}</Btn>
+        </div>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(12), fontSize: TEXT.base }}>
+        <div style={{ color: p.txt2 }}>
+          {report.ok
+            ? t("settings.dbConsistencyOk")
+            : t("settings.dbConsistencyFailed", { count: report.issues.length })}
+        </div>
+        {!report.integrityOk && (
+          <div
+            style={{
+              fontSize: TEXT.small,
+              color: p.red,
+              padding: `${rem(8)} ${rem(10)}`,
+              borderRadius: 8,
+              background: rgba(p.red, 0.1),
+              border: `1px solid ${rgba(p.red, 0.4)}`,
+            }}
+          >
+            {t("settings.dbFileCorrupt")}
+          </div>
+        )}
+        {report.issues.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: rem(6),
+              maxHeight: rem(280),
+              overflowY: "auto",
+            }}
+          >
+            {report.issues.map((it, i) => (
+              <div
+                key={`${it.kind}-${it.itemIdHex}-${i}`}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: rem(3),
+                  padding: `${rem(8)} ${rem(10)}`,
+                  borderRadius: 8,
+                  background: p.bg2,
+                  border: `1px solid ${p.line}`,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "baseline", gap: rem(8) }}>
+                  <span style={{ fontSize: TEXT.small, color: p.red, fontWeight: 600 }}>
+                    {t(`settings.dbIssue.${it.kind}`)}
+                  </span>
+                  {/* Hex ids are long and the tail carries no information a human
+                      uses — enough to tell two rows apart is the whole job. */}
+                  <span style={{ fontFamily: MONO, fontSize: TEXT.micro, color: p.txt3 }}>
+                    {it.vaultIdHex.slice(0, 8)}/{it.itemIdHex.slice(0, 12)}
+                  </span>
+                </div>
+                {it.detail && (
+                  <span style={{ fontSize: TEXT.small, color: p.txt2, overflowWrap: "anywhere" }}>
+                    {it.detail}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ── About ──────────────────────────────────────────────────────
+function AboutRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+  const p = usePalette();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: isMobile ? "column" : "row",
+        alignItems: isMobile ? "stretch" : "baseline",
+        gap: isMobile ? rem(2) : rem(10),
+        padding: `${rem(11)} 0`,
+        borderBottom: `1px solid ${p.line}`,
+      }}
+    >
+      <span style={{ width: isMobile ? "auto" : rem(150), fontSize: TEXT.base, color: p.txt3 }}>{k}</span>
+      <span
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontSize: TEXT.base,
+          color: p.txt,
+          fontFamily: mono ? MONO : UI,
+          wordBreak: isMobile ? "break-all" : undefined,
+        }}
+      >
+        {v}
+      </span>
+    </div>
+  );
+}
+
+/** External link row: the URL stays visible and copyable, and can also be opened in the
+ *  system browser (`opener:default` is granted in src-tauri/capabilities;
+ *  ViewTerminal uses the same call for terminal web-links). Copy is kept alongside Open
+ *  because a copied URL is what you need when the machine running Remora is not the
+ *  machine you browse from. */
+function LinkRow({ label, url }: { label: string; url: string }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const copy = async () => {
+    await guard(async () => {
+      await writeText(url);
+      toast(t("settings.linkCopied"), "ok");
+    });
+  };
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: isMobile ? "column" : "row",
+        alignItems: isMobile ? "stretch" : "center",
+        gap: isMobile ? rem(2) : rem(10),
+        padding: `${rem(7)} 0`,
+        borderBottom: `1px solid ${p.line}`,
+      }}
+    >
+      <span style={{ width: isMobile ? "auto" : rem(150), fontSize: TEXT.base, color: p.txt3, flexShrink: 0 }}>
+        {label}
+      </span>
+      <span
+        className="uh-selectable"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontSize: TEXT.base,
+          fontFamily: MONO,
+          color: p.txt,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {url}
+      </span>
+      <Btn
+        variant="ghost"
+        size="sm"
+        icon="ar"
+        onClick={() => void guard(async () => openUrl(url))}
+        title={t("support.open")}
+        aria-label={`${t("support.open")}: ${label}`}
+      />
+      <Btn
+        variant="ghost"
+        size="sm"
+        icon="copy"
+        onClick={copy}
+        title={t("settings.copyLink")}
+        aria-label={t("settings.copyLink")}
+      />
+    </div>
+  );
+}
+
+function SettingsAbout() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [platformStr, setPlatformStr] = useState("…");
+  const [engineStr, setEngineStr] = useState("Tauri 2.0");
+  const [acctId, setAcctId] = useState("…");
+  // Live app version (same source the diagnostics copy uses) — never hardcoded.
+  const [appVersion, setAppVersion] = useState("…");
+
+  useEffect(() => {
+    let alive = true;
+    getVersion()
+      .then((v) => {
+        if (alive) setAppVersion(v);
+      })
+      .catch(() => {
+        if (alive) setAppVersion("—"); /* not in a Tauri context */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const plat = platform();
+        const a = arch();
+        const v = osVersion();
+        if (!alive) return;
+        setPlatformStr(`${plat} · ${a}`);
+        setEngineStr(`Tauri 2.0 · ${plat} ${v}`);
+      } catch {
+        /* keep defaults — info only available inside Tauri */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const id = await api.accountId();
+        if (alive) setAcctId(id);
+      } catch {
+        if (alive) setAcctId("—");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(14), marginBottom: rem(18) }}>
+        <span
+          style={{
+            width: rem(56),
+            height: rem(56),
+            borderRadius: 16,
+            background: p.accent,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="terminal" size={26} color={p.accentInk} stroke={2} />
+        </span>
+        <div>
+          <div style={{ fontSize: TEXT.h3, fontWeight: 800, letterSpacing: rem(-0.4) }}>Remora</div>
+          <div style={{ fontSize: TEXT.base, color: p.txt3 }}>{t("settings.tagline")}</div>
+        </div>
+      </div>
+      <AboutRow k={t("settings.aboutVersion")} v={appVersion} mono />
+      <AboutRow k={t("settings.aboutPlatform")} v={platformStr} />
+      <AboutRow k={t("settings.aboutEngine")} v={engineStr} />
+      <AboutRow k={t("settings.accountId")} v={acctId} mono />
+      <AboutRow k={t("settings.aboutLicense")} v="MIT OR Apache-2.0" />
+      <LinkRow label={t("settings.website")} url="https://unissh.dev/" />
+      <LinkRow label="GitHub" url="https://github.com/goduni/unissh" />
+      <SettingsUpdates />
+    </>
+  );
+}
+
+/** Update controls. Hidden entirely where there is no updater — mobile sideload
+ *  builds and a plain browser preview — rather than shown greyed out: a control
+ *  that can never do anything is worse than its absence. */
+function SettingsUpdates() {
+  const { t } = useTranslation();
+  const state = useUpdate((s) => s.state);
+  const info = useUpdate((s) => s.info);
+  const installing = useUpdate((s) => s.installing);
+  const autoCheck = useUpdate((s) => s.autoCheck);
+  const setAutoCheck = useUpdate((s) => s.setAutoCheck);
+  const check = useUpdate((s) => s.check);
+  const install = useUpdate((s) => s.install);
+
+  if (!updatesSupported(osPlatform())) return null;
+
+  const status =
+    state === "checking"
+      ? t("update.checking")
+      : info
+        ? t("update.available", { version: info.version })
+        : state === "current"
+          ? t("update.upToDate")
+          : state === "error"
+            ? t("update.checkFailed")
+            : t("update.statusDesc");
+
+  return (
+    <>
+      <SectionLabel>{t("settings.sectionUpdates")}</SectionLabel>
+      <SettingRow title={t("update.statusTitle")} desc={status}>
+        {info ? (
+          <Btn size="sm" icon="download" onClick={() => void install()} disabled={installing}>
+            {installing ? t("update.installing") : t("update.install")}
+          </Btn>
+        ) : (
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="refresh"
+            onClick={() => void check(true)}
+            disabled={state === "checking"}
+          >
+            {t("update.checkNow")}
+          </Btn>
+        )}
+      </SettingRow>
+      <SettingRow title={t("update.autoTitle")} desc={t("update.autoDesc")}>
+        <Toggle checked={autoCheck} onChange={setAutoCheck} />
+      </SettingRow>
+    </>
+  );
+}
+
+// ── Vaults ─────────────────────────────────────────────────────
+function SettingsVaults() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const vaults = useApp((s) => s.vaults);
+  const vaultId = useApp((s) => s.vaultId);
+  const openModal = useApp((s) => s.openModal);
+  const setConfirm = useApp((s) => s.setConfirm);
+  const servers = useApp((s) => s.servers);
+  const activeServerId = useApp((s) => s.activeServerId);
+
+  // Inline "pick a server" popover for Bind / Move (the accessible path alongside
+  // drag-and-drop): holds the vault id whose picker is open.
+  const [pickerVault, setPickerVault] = useState<string | null>(null);
+  // The integrity result, kept on screen until dismissed. A toast was the whole
+  // report before: it auto-dismissed in under three seconds on success, and on
+  // failure it showed a COUNT while the per-item issues the core had just
+  // computed were dropped on the floor. An answer to "is my vault intact" has to
+  // outlive a glance, and a failure has to say which items.
+  const [integrity, setIntegrity] = useState<{
+    vault: string;
+    report: VaultIntegrityReport;
+  } | null>(null);
+  // Export asks for a passphrase before it can write anything; import asks for
+  // one plus a name. Two slots rather than one, because they are different
+  // questions and sharing a dialog would mean a field that means "the passphrase
+  // I am choosing" in one direction and "the passphrase it was made with" in the
+  // other.
+  const [exporting, setExporting] = useState<VaultInfo | null>(null);
+  const [importing, setImporting] = useState(false);
+  // Selected server id in the bind/move modal (which vault is being (re)homed is
+  // held by `pickerVault`).
+  const [bindSel, setBindSel] = useState<string | null>(null);
+  // Drag-and-drop: `dragId` is the live source (a ref, read in dragover/drop without
+  // forcing a re-render); `dragging`/`dragOver` drive the visual state only.
+  const dragId = useRef<string | null>(null);
+  const [dragging, setDragging] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<string | null>(null);
+
+  const reload = () => useApp.getState().reloadVaults();
+  const errToast = (e: unknown) => toast(apiErrorMessage(e), "err");
+
+  // "Move to server…" on a local vault: the vault + its items (for the per-kind
+  // counts in the confirmation).
+  const [moving, setMoving] = useState<{ vault: VaultInfo; items: ItemInfo[] } | null>(null);
+
+  const startMove = async (v: VaultInfo) => {
+    // The core needs a space id and the first push needs a session: with no
+    // signed-in server there is nothing to move to, so say why up front.
+    if (planMoveToServer([], servers).servers.length === 0) {
+      toast(t("vault.toServerNeedsSession"), "warn");
+      return;
+    }
+    try {
+      const items = await api.listItems(v.vaultId);
+      setMoving({ vault: v, items });
+    } catch (e) {
+      errToast(e);
+    }
+  };
+
+  // Binding management (bind / move / unbind) is OWNER-ONLY: only a vault you
+  // administer (admin in its space) may be re-homed. A member sees where a shared
+  // vault lives but can't move it — that would desync the team and scatter the
+  // owner's ciphertext onto personal servers (it grants a member no new plaintext,
+  // since they can already decrypt, but WHERE the vault syncs is the owner's call).
+  const owned = (v: VaultInfo) => isOwnedCloud(v, servers);
+  // Bindable = a cloud vault you may (re)home to a server. A vault with NO binding
+  // at all (empty syncTenant) is yours to bind — isOwnedCloud can't read a role from
+  // a Space that doesn't exist yet, so binding must not require `owned` there (that
+  // was the catch-22 that left unbound vaults unbindable). A bound vault stays
+  // owner-only. Used by both the Bind affordance and the actual (re)bind action.
+  const canRehome = (v: VaultInfo) =>
+    v.syncTarget === "cloud" && (!v.syncTenant || owned(v));
+
+  const cloudVaults = vaults.filter((v) => v.syncTarget === "cloud");
+  const localVaults = vaults.filter((v) => v.syncTarget !== "cloud");
+  const vaultsOn = (s: ServerStatus) =>
+    cloudVaults.filter((v) => vaultServer(v, servers)?.serverId === s.serverId);
+  // Cloud vaults resolving to NO linked server: unbound (empty tenant) or bound to a
+  // server that isn't linked here. They don't sync until (re)bound.
+  const unboundVaults = cloudVaults.filter((v) => vaultServer(v, servers) == null);
+
+  // Bind an unbound vault to a server AND push it right away, so it lands on the
+  // server immediately instead of waiting for the next sync. The bind is a local
+  // label change (always succeeds); the follow-up sync is best-effort — with no
+  // session the vault is bound and will sync later.
+  const bindTo = async (v: VaultInfo, serverId: string) => {
+    try {
+      await api.serverBindCloudVault(v.vaultId, serverId);
+    } catch (e) {
+      errToast(e);
+      return;
+    }
+    setPickerVault(null);
+    setBindSel(null);
+    try {
+      await api.serverSyncNow(serverId);
+    } catch {
+      /* bound; the push happens on the next sync */
+    }
+    void reload();
+    toast(t("vault.boundDone"), "ok");
+  };
+
+  // (Re)bind a vault to `s`. A MOVE (it was already bound to a linked server) is
+  // confirmed first and we're explicit that the OLD server keeps its (encrypted)
+  // copy — Move re-points syncing, it does NOT delete remotely.
+  const rebindTo = (v: VaultInfo, s: ServerStatus) => {
+    if (!s.serverId || !canRehome(v)) return;
+    if (vaultServer(v, servers)?.serverId === s.serverId) return; // already there
+    if (vaultServer(v, servers) == null) {
+      void bindTo(v, s.serverId);
+      return;
+    }
+    setConfirm({
+      title: t("vault.moveTitle"),
+      body: t("vault.moveBody", { name: v.name, server: serverShortLabel(s) }),
+      confirmLabel: t("vault.moveConfirm"),
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.serverBindCloudVault(v.vaultId, s.serverId!);
+          // Push to the new server right away (best-effort — bound regardless).
+          await api.serverSyncNow(s.serverId!).catch(() => {});
+          await reload();
+          setPickerVault(null);
+          setBindSel(null);
+          toast(t("vault.moveDone"), "ok");
+        });
+      },
+    });
+  };
+
+  const syncNow = (s: ServerStatus) => {
+    if (!s.serverId) return;
+    void guard(async () => {
+      await api.serverSyncNow(s.serverId!);
+      await reload();
+      toast(t("vault.syncDone"), "ok");
+    });
+  };
+
+  // Unbind a bound cloud vault (confirm first): it stops syncing and stays only on
+  // this device. Data already on the server is untouched; it can be bound again.
+  const onUnbindVault = (v: VaultInfo) => {
+    setConfirm({
+      title: t("vault.unbindTitle"),
+      body: t("vault.unbindBody", { name: v.name }),
+      confirmLabel: t("vault.unbind"),
+      onConfirm: async () => {
+        await guard(async () => {
+          const changed = await api.serverUnbindCloudVault(v.vaultId);
+          await useApp.getState().reloadVaults();
+          if (changed) toast(t("vault.unbindDone"), "ok");
+        });
+      },
+    });
+  };
+
+  const remove = (v: VaultInfo) => {
+    if (vaults.length <= 1) {
+      toast(t("vault.cannotDeleteLast"), "warn");
+      return;
+    }
+    setConfirm({
+      title: t("vault.deleteTitle"),
+      body: t("vault.deleteBody", { name: v.name }),
+      danger: true,
+      confirmLabel: t("vault.deleteConfirm"),
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.deleteVault(v.vaultId);
+          await useApp.getState().reloadVaults();
+          toast(t("vault.removed"), "ok");
+        });
+      },
+    });
+  };
+
+  const verify = async (v: VaultInfo) => {
+    await guard(async () => {
+      const r = await api.verifyVaultIntegrity(v.vaultId);
+      setIntegrity({ vault: v.name, report: r });
+    });
+  };
+
+  const purge = (v: VaultInfo) => {
+    if (vaults.length <= 1) {
+      toast(t("vault.cannotDeleteLast"), "warn");
+      return;
+    }
+    setConfirm({
+      title: t("vault.purgeTitle"),
+      body: t("vault.purgeBody", { name: v.name }),
+      danger: true,
+      confirmLabel: t("vault.purgeConfirm"),
+      icon: "trash",
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.purgeVault(v.vaultId);
+          await useApp.getState().reloadVaults();
+          // After the switch away, so a late layout save cannot re-add it.
+          forgetTerminalWorkspace(v.vaultId);
+          toast(t("vault.purged"), "ok");
+        });
+      },
+    });
+  };
+
+  // ── one vault row ─────────────────────────────────────────────
+  const vaultRow = (v: VaultInfo, kind: "server" | "local" | "unbound") => {
+    const isCurrent = v.vaultId === vaultId;
+    const canBind = kind !== "local" && canRehome(v); // owner-only for bound; open for unbound
+    const isMember = kind === "server" && !owned(v);
+    // Rename + delete are owner-only in core (require_owner → AuthorityInvalid for a
+    // member), so don't offer them on a shared vault you don't own. Verify + purge are
+    // local (a member can integrity-check and remove their own copy).
+    const canEdit = kind === "local" || owned(v);
+    const targets =
+      kind === "server"
+        ? servers.filter(
+            (s) => s.serverId != null && s.serverId !== vaultServer(v, servers)?.serverId,
+          )
+        : servers.filter((s) => s.serverId != null);
+    return (
+      <div
+        key={v.vaultId}
+        draggable={canBind}
+        onDragStart={
+          canBind
+            ? (e) => {
+                dragId.current = v.vaultId;
+                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.setData("text/plain", v.vaultId);
+                setDragging(v.vaultId);
+              }
+            : undefined
+        }
+        onDragEnd={
+          canBind
+            ? () => {
+                dragId.current = null;
+                setDragging(null);
+                setDragOver(null);
+              }
+            : undefined
+        }
+        style={{
+          display: "flex",
+          alignItems: "center",
+          // Always wrap: on desktop the trailing destructive move/unbind/delete
+          // Btns were clipped by groupBox overflow:hidden. rowGap spaces wrapped rows.
+          flexWrap: "wrap",
+          gap: rem(10),
+          rowGap: rem(10),
+          padding: `${rem(12)} ${rem(14)}`,
+          borderTop: `1px solid ${p.line}`,
+          background: isCurrent ? p.bg2 : "transparent",
+          opacity: dragging === v.vaultId ? 0.45 : 1,
+          cursor: canBind ? "grab" : "default",
+        }}
+      >
+        <Icon name="layers" size={16} color={p.txt3} />
+        <div
+          style={{
+            flex: 1,
+            minWidth: isMobile ? "100%" : 0,
+            display: "flex",
+            alignItems: "center",
+            gap: rem(8),
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ fontSize: TEXT.base, fontWeight: 650 }}>{v.name}</span>
+          {isCurrent && <Tag>{t("vault.current")}</Tag>}
+          {kind === "local" && <VaultBadge target="local" label={t("vault.local")} />}
+          {isMember && (
+            <span
+              title={t("vault.memberManaged")}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: rem(5),
+                fontSize: TEXT.micro,
+                color: p.txt3,
+              }}
+            >
+              <Icon name="lock" size={12} color={p.txt3} />
+              {t("vault.roleMember")}
+            </span>
+          )}
+          {kind === "unbound" && (
+            <span style={{ fontSize: TEXT.micro, color: p.amber, fontWeight: 600, whiteSpace: "nowrap" }}>
+              {t("vault.wontSync")}
+            </span>
+          )}
+        </div>
+
+        {canBind && targets.length > 0 && (
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="cloud"
+            onClick={() => {
+              setBindSel(targets.length === 1 ? (targets[0].serverId ?? null) : null);
+              setPickerVault(v.vaultId);
+            }}
+          >
+            {t(kind === "server" ? "vault.move" : "vault.bind")}
+          </Btn>
+        )}
+        {kind === "local" && (
+          <Btn variant="ghost" size="sm" icon="cloud" onClick={() => void startMove(v)}>
+            {t("vault.toServer")}
+          </Btn>
+        )}
+        {canBind && kind === "server" && (
+          <Btn variant="ghost" size="sm" onClick={() => onUnbindVault(v)}>
+            {t("vault.unbind")}
+          </Btn>
+        )}
+
+        {canEdit && (
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="pencil"
+            title={t("vault.rename")}
+            onClick={() => openModal({ kind: "vault", edit: v })}
+          />
+        )}
+        <Btn
+          variant="ghost"
+          size="sm"
+          icon="shieldcheck"
+          title={t("vault.verify")}
+          onClick={() => verify(v)}
+        />
+        <Btn
+          variant="ghost"
+          size="sm"
+          icon="download"
+          title={t("vault.exportBackup")}
+          onClick={() => setExporting(v)}
+        />
+        <Btn
+          variant="ghost"
+          size="sm"
+          icon="zap"
+          title={isMember ? t("vault.removeLocal") : t("vault.purge")}
+          disabled={vaults.length <= 1}
+          onClick={() => purge(v)}
+          style={{ color: p.red, borderColor: rgba(p.red, 0.4) }}
+        />
+        {canEdit && (
+          <Btn
+            variant="ghost"
+            size="sm"
+            icon="trash"
+            title={t("common.delete")}
+            disabled={vaults.length <= 1}
+            onClick={() => remove(v)}
+            style={{ color: p.red, borderColor: rgba(p.red, 0.4) }}
+          />
+        )}
+      </div>
+    );
+  };
+
+  // Bordered "group box" holding the rows; a server box is a drop target for owner
+  // vaults (drop = bind/move to that server).
+  const groupBox = (children: React.ReactNode, dropServerId?: string) => {
+    const over = dropServerId != null && dragOver === dropServerId;
+    return (
+      <div
+        onDragOver={
+          dropServerId != null
+            ? (e) => {
+                if (dragId.current) {
+                  e.preventDefault();
+                  setDragOver(dropServerId);
+                }
+              }
+            : undefined
+        }
+        onDragLeave={
+          dropServerId != null
+            ? () => setDragOver((o) => (o === dropServerId ? null : o))
+            : undefined
+        }
+        onDrop={
+          dropServerId != null
+            ? (e) => {
+                e.preventDefault();
+                const vid = dragId.current;
+                dragId.current = null;
+                setDragging(null);
+                setDragOver(null);
+                const s = servers.find((x) => x.serverId === dropServerId);
+                const v = vaults.find((x) => x.vaultId === vid);
+                if (v && s) rebindTo(v, s);
+              }
+            : undefined
+        }
+        style={{
+          border: `1px solid ${over ? p.accent : p.line}`,
+          borderRadius: 12,
+          overflow: "hidden",
+          background: over ? p.bg2 : "transparent",
+          transition: "border-color .12s, background .12s",
+        }}
+      >
+        {children}
+      </div>
+    );
+  };
+
+  const groupIcon = (name: IconName, color: string, borderColor: string) => (
+    <span
+      style={{
+        width: rem(28),
+        height: rem(28),
+        borderRadius: 8,
+        flex: "none",
+        display: "grid",
+        placeItems: "center",
+        border: `1px solid ${borderColor}`,
+        color,
+      }}
+    >
+      <Icon name={name} size={15} />
+    </span>
+  );
+
+  const serverGroup = (s: ServerStatus) => {
+    const vs = vaultsOn(s);
+    const isActive = s.serverId === activeServerId;
+    return (
+      <div key={s.serverId ?? s.baseUrl ?? ""} style={{ marginBottom: rem(22) }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: rem(10),
+            padding: `0 ${rem(2)} ${rem(9)}`,
+            flexWrap: "wrap", // let the "Sync now" Btn drop below the server name when narrow
+          }}
+        >
+          {groupIcon("cloud", p.txt, p.line)}
+          <div
+            style={{ display: "flex", alignItems: "center", gap: rem(8), minWidth: 0, flexWrap: "wrap" }}
+          >
+            <span style={{ fontSize: TEXT.body, fontWeight: 700 }}>{serverShortLabel(s)}</span>
+            {s.handle && (
+              <span
+                style={{
+                  fontSize: TEXT.small,
+                  color: p.txt3,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: rem(4),
+                }}
+                title={t("vault.srvAccount")}
+              >
+                <Icon name="fingerprint" size={11} color={p.txt3} />
+                {s.handle}
+              </span>
+            )}
+            <span
+              style={{
+                width: rem(7),
+                height: rem(7),
+                borderRadius: "50%",
+                background: s.hasSession ? p.green : p.txt3,
+                opacity: s.hasSession ? 1 : 0.5,
+              }}
+            />
+            <span style={{ fontSize: TEXT.small, color: p.txt3 }}>
+              {s.hasSession ? t("vault.srvConnected") : t("vault.srvSignedOut")}
+            </span>
+            {isActive && <Tag>{t("vault.srvActive")}</Tag>}
+          </div>
+          <div style={{ flex: 1 }} />
+          {s.hasSession && (
+            <Btn variant="ghost" size="sm" icon="refresh" onClick={() => syncNow(s)}>
+              {t("vault.syncNow")}
+            </Btn>
+          )}
+        </div>
+        {groupBox(
+          vs.length === 0 ? (
+            <div style={{ padding: `${rem(14)} ${rem(15)}`, fontSize: TEXT.base, color: p.txt3 }}>
+              {dragging ? t("vault.dropHere") : t("vault.emptyServer")}
+            </div>
+          ) : (
+            vs.map((v) => vaultRow(v, "server"))
+          ),
+          s.serverId ?? undefined,
+        )}
+      </div>
+    );
+  };
+
+  const localGroup = () => (
+    <div style={{ marginBottom: rem(22) }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), padding: `0 ${rem(2)} ${rem(9)}` }}>
+        {groupIcon("home", p.txt3, p.line)}
+        <span style={{ fontSize: TEXT.body, fontWeight: 700 }}>{t("vault.grpLocal")}</span>
+        <span style={{ fontSize: TEXT.small, color: p.txt3 }}>· {t("vault.grpLocalHint")}</span>
+      </div>
+      {groupBox(localVaults.map((v) => vaultRow(v, "local")))}
+    </div>
+  );
+
+  const unboundGroup = () => (
+    <div style={{ marginBottom: rem(22) }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), padding: `0 ${rem(2)} ${rem(9)}` }}>
+        {groupIcon("alert", p.amber, rgba(p.amber, 0.4))}
+        <span style={{ fontSize: TEXT.body, fontWeight: 700, color: p.amber }}>
+          {t("vault.grpUnbound")}
+        </span>
+        <span style={{ fontSize: TEXT.small, color: p.amber, opacity: 0.85 }}>
+          · {t("vault.grpUnboundHint")}
+        </span>
+      </div>
+      {groupBox(unboundVaults.map((v) => vaultRow(v, "unbound")))}
+    </div>
+  );
+
+  return (
+    <>
+      <SectionLabel first>{t("vault.manage")}</SectionLabel>
+      <div style={{ fontSize: TEXT.base, color: p.txt3, margin: `${rem(6)} 0 ${rem(18)}`, maxWidth: rem(560) }}>
+        {t("vault.topoDesc")}
+      </div>
+
+      {servers.map((s) => serverGroup(s))}
+      {localVaults.length > 0 && localGroup()}
+      {unboundVaults.length > 0 && unboundGroup()}
+
+      <div style={{ marginTop: rem(20), display: "flex", gap: rem(8), flexWrap: "wrap" }}>
+        <Btn icon="plus" onClick={() => openModal({ kind: "vault" })}>
+          {t("vault.create")}
+        </Btn>
+        <Btn variant="ghost" icon="upload" onClick={() => setImporting(true)}>
+          {t("vault.importBackup")}
+        </Btn>
+      </div>
+
+      {pickerVault &&
+        (() => {
+          const v = vaults.find((x) => x.vaultId === pickerVault);
+          if (!v) return null;
+          const current = vaultServer(v, servers)?.serverId;
+          const isMove = current != null;
+          const opts = servers.filter((s) => s.serverId != null && s.serverId !== current);
+          const close = () => {
+            setPickerVault(null);
+            setBindSel(null);
+          };
+          return (
+            <Modal
+              icon="cloud"
+              title={t(isMove ? "vault.move" : "vault.bind")}
+              subtitle={v.name}
+              onClose={close}
+              w={420}
+              footer={
+                <>
+                  <Btn variant="ghost" onClick={close}>
+                    {t("common.cancel")}
+                  </Btn>
+                  <Btn
+                    variant="primary"
+                    disabled={!bindSel}
+                    onClick={() => {
+                      const s = opts.find((x) => x.serverId === bindSel);
+                      close();
+                      if (s) rebindTo(v, s);
+                    }}
+                  >
+                    {t(isMove ? "vault.move" : "vault.bind")}
+                  </Btn>
+                </>
+              }
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: rem(8) }}>
+                {opts.map((s) => {
+                  const active = bindSel === s.serverId;
+                  return (
+                    <button
+                      key={s.serverId!}
+                      onClick={() => setBindSel(s.serverId ?? null)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: rem(10),
+                        padding: `${rem(12)} ${rem(14)}`,
+                        borderRadius: 10,
+                        cursor: "pointer",
+                        textAlign: "left",
+                        border: `1px solid ${active ? p.accent : p.line}`,
+                        background: active ? rgba(p.accent, 0.1) : p.bg2,
+                        color: p.txt,
+                      }}
+                    >
+                      <Icon name="cloud" size={16} color={active ? p.accentText : p.txt3} />
+                      <span style={{ flex: 1, fontSize: TEXT.base }}>{serverShortLabel(s)}</span>
+                      {active && <Icon name="check" size={15} color={p.accentText} />}
+                    </button>
+                  );
+                })}
+              </div>
+            </Modal>
+          );
+        })()}
+
+      {moving && (
+        <MoveToServerModal
+          vault={moving.vault}
+          items={moving.items}
+          onClose={() => setMoving(null)}
+        />
+      )}
+
+      {exporting && (
+        <BackupExport vault={exporting} onClose={() => setExporting(null)} />
+      )}
+      {importing && (
+        <BackupImport
+          onClose={() => setImporting(false)}
+          onDone={() => {
+            setImporting(false);
+            void useApp.getState().reloadVaults();
+          }}
+        />
+      )}
+
+      {integrity && (
+        <IntegrityResult
+          vault={integrity.vault}
+          report={integrity.report}
+          onClose={() => setIntegrity(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/** "Move to server…" confirmation for a local vault: target server (picked when
+ *  several are signed in) and space (picked when the server has more than one you
+ *  administer, fetched live as cloud-vault creation does), item counts by kind,
+ *  and what the move does. "Export backup first" opens the regular backup export
+ *  for this vault and comes back here (picks kept) when it closes. Confirm
+ *  converts the vault in the core and runs the first push; a failed push leaves
+ *  the move in place. */
+function MoveToServerModal({
+  vault,
+  items,
+  onClose,
+}: {
+  vault: VaultInfo;
+  items: ItemInfo[];
+  onClose: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const servers = useApp((s) => s.servers);
+  const activeServerId = useApp((s) => s.activeServerId);
+  const isCurrent = useApp((s) => s.vaultId === vault.vaultId);
+  const openCount = useApp(
+    (s) =>
+      s.terminals.filter((tab) => tab.panes.some((pane) => pane.status !== "restored")).length +
+      s.tunnels.length +
+      s.broadcasts.length +
+      s.sftpSessions.length,
+  );
+  const [serverId, setServerId] = useState<string | null>(null);
+  const [spaceId, setSpaceId] = useState("");
+  // Live space list of the target server: null while loading; a failed fetch
+  // yields [] (→ primary space).
+  const [spaces, setSpaces] = useState<SpaceInfo[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  // The backup export replaces this dialog while it is open; this component stays
+  // mounted underneath, so the server/space picks survive the round trip.
+  const [exporting, setExporting] = useState(false);
+
+  const plan = planMoveToServer(items, servers, { serverId, activeServerId, spaces, spaceId });
+  const target = plan.server;
+  const space = plan.space;
+
+  useEffect(() => {
+    if (!target?.serverId) return;
+    let alive = true;
+    setSpaces(null);
+    api
+      .serverListSpaces(target.serverId)
+      .then((list) => {
+        if (alive) setSpaces(list);
+      })
+      .catch(() => {
+        if (alive) setSpaces([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [target?.serverId]);
+
+  const close = () => {
+    if (!busy) onClose();
+  };
+
+  const confirm = async () => {
+    if (!target?.serverId || busy) return;
+    setBusy(true);
+    const nonPrimary = plan.nonPrimarySpace;
+    const res = await api
+      .serverMoveVaultToServer(vault.vaultId, target.serverId, space?.spaceId)
+      .catch((e: unknown) => {
+        toast(apiErrorMessage(e), "err");
+        setBusy(false);
+        return null;
+      });
+    if (!res) return;
+    // The move is done: the local vault no longer exists, so a retry from this dialog
+    // could only fail. Close it whatever the follow-up steps below do.
+    onClose();
+    try {
+      // Saved layouts follow the vault: its hosts keep their ids under the new vault id.
+      moveTerminalWorkspace(vault.vaultId, res.vaultId);
+      if (useApp.getState().vaultId === vault.vaultId) {
+        // The local id is gone. Refresh the list first so the switch to the new id is
+        // the forced kind (the open connections were announced in this dialog) and the
+        // reload below does not fall back to the first vault.
+        useApp.setState({ vaults: await api.listVaults() });
+        await useApp.getState().setVault(res.vaultId);
+      }
+      await useApp.getState().reloadVaults();
+    } catch (e) {
+      toast(t("vault.toServerRefreshFailed", { reason: apiErrorMessage(e) }), "warn");
+    }
+    if (res.pushError) {
+      const reason = apiErrorMessage(res.pushError);
+      toast(
+        nonPrimary && space
+          ? t("vault.toServerPushFailedSpace", { reason, space: space.name || space.spaceId })
+          : t("vault.toServerPushFailed", { reason }),
+        "warn",
+      );
+    } else {
+      toast(t("vault.toServerDone", { name: vault.name, server: serverShortLabel(target) }), "ok");
+    }
+  };
+
+  if (exporting) return <BackupExport vault={vault} onClose={() => setExporting(false)} />;
+
+  return (
+    <Modal
+      icon="cloud"
+      title={t("vault.toServerTitle")}
+      subtitle={vault.name}
+      onClose={close}
+      w={480}
+      footer={
+        <>
+          <Btn
+            variant="ghost"
+            icon="download"
+            onClick={() => setExporting(true)}
+            disabled={busy}
+            style={{ marginRight: "auto" }}
+          >
+            {t("vault.toServerBackupFirst")}
+          </Btn>
+          <Btn variant="ghost" onClick={close} disabled={busy}>
+            {t("common.cancel")}
+          </Btn>
+          {/* Disabled while the space list loads: a quick click must not skip the
+              space picker that appears once the server lists several spaces. */}
+          <Btn
+            variant="primary"
+            icon="cloud"
+            disabled={!target || spaces === null || busy}
+            onClick={() => void confirm()}
+          >
+            {t("vault.toServerConfirm")}
+          </Btn>
+        </>
+      }
+    >
+      <Field label={t("vault.toServerServer")}>
+        {plan.needsServerPicker ? (
+          <NHSelect
+            value={target?.serverId ?? ""}
+            onChange={(id) => {
+              setServerId(id);
+              setSpaceId("");
+            }}
+            options={plan.servers.map((s) => ({ value: s.serverId as string, label: serverShortLabel(s) }))}
+            empty=""
+          />
+        ) : (
+          <div style={{ fontSize: TEXT.base, fontWeight: 600 }}>{target ? serverShortLabel(target) : ""}</div>
+        )}
+      </Field>
+      <Field label={t("vault.toServerSpace")}>
+        {plan.needsSpacePicker ? (
+          <NHSelect
+            value={space?.spaceId ?? ""}
+            onChange={setSpaceId}
+            options={plan.spaces.map((sp) => ({ value: sp.spaceId, label: sp.name || sp.spaceId }))}
+            empty=""
+          />
+        ) : (
+          <div style={{ fontSize: TEXT.base, fontWeight: 600 }}>
+            {spaces === null ? <Spinner size={14} /> : space ? space.name || space.spaceId : t("vault.toServerPrimarySpace")}
+          </div>
+        )}
+      </Field>
+      <Field label={t("vault.toServerContents")}>
+        {plan.counts.length === 0 ? (
+          <div style={{ fontSize: TEXT.base, color: p.txt3 }}>{t("vault.toServerEmpty")}</div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: rem(6) }}>
+            {plan.counts.map((c) => (
+              <Tag key={c.kind}>
+                {tDyn(`vault.toServerKind.${c.kind}`)}: {c.count}
+              </Tag>
+            ))}
+          </div>
+        )}
+      </Field>
+      <div style={{ fontSize: TEXT.small, color: p.txt3, lineHeight: 1.5 }}>
+        <p style={{ margin: `0 0 ${rem(6)}` }}>{t("vault.toServerReplaces", { name: vault.name })}</p>
+        <p style={{ margin: 0 }}>{t("vault.toServerHistory")}</p>
+        {plan.nonPrimarySpace && space && (
+          <p style={{ margin: `${rem(6)} 0 0`, color: p.amber }}>
+            {t("vault.toServerNotPrimary", { space: space.name || space.spaceId })}
+          </p>
+        )}
+        {isCurrent && openCount > 0 && (
+          <p style={{ margin: `${rem(6)} 0 0`, color: p.amber }}>
+            {t("vault.toServerClosesSessions", { count: openCount })}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** The result of a vault integrity check, kept on screen until dismissed.
+ *
+ *  A toast was the whole report before: it auto-dismissed in under three seconds
+ *  on success, and on failure it showed a COUNT while the per-item issues the
+ *  core had just computed were dropped. "3 issues" tells you to worry; the item
+ *  and the way it failed tells you what to do. */
+/** Choose a passphrase, pick a file, write the backup.
+ *
+ *  The passphrase is asked for here and nowhere else, because the bundle is
+ *  decryptable with it ALONE — no keyset, no account, no server. That is what
+ *  makes a backup worth having and also the entire risk of one, so it is the
+ *  user's to choose and is never stored. Two fields, because a typo in a
+ *  passphrase you will not use for months is an unrecoverable file. */
+function BackupExport({ vault, onClose }: { vault: VaultInfo; onClose: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [pass, setPass] = useState("");
+  const [again, setAgain] = useState("");
+  const [busy, setBusy] = useState(false);
+  const mismatch = again.length > 0 && pass !== again;
+  const ready = pass.length >= 8 && pass === again && !busy;
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const name = `${vault.name.replace(/[^\w.-]+/g, "_") || "vault"}.unisshbak`;
+      const path = await save({
+        defaultPath: await exportPath(name),
+        filters: [{ name: "Remora backup", extensions: ["unisshbak"] }],
+      });
+      if (!path) {
+        setBusy(false);
+        return;
+      }
+      // Same reason as the recording export: the native panel owns the final
+      // name and drops an extension it does not recognise.
+      const target = path.toLowerCase().endsWith(".unisshbak") ? path : `${path}.unisshbak`;
+      const size = await api.vaultExportBackup(vault.vaultId, pass, target);
+      toast(t("vault.backupWritten", { size: Math.max(1, Math.round(size / 1024)) }), "ok");
+      onClose();
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      icon="download"
+      title={t("vault.exportBackup")}
+      subtitle={vault.name}
+      onClose={onClose}
+      w={440}
+      footer={
+        <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end", width: "100%" }}>
+          <Btn variant="ghost" onClick={onClose} disabled={busy}>
+            {t("common.cancel")}
+          </Btn>
+          <Btn onClick={run} disabled={!ready}>
+            {busy ? t("vault.backupWriting") : t("vault.exportBackup")}
+          </Btn>
+        </div>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(12) }}>
+        <div style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+          {t("vault.backupExplain")}
+        </div>
+        <Field label={t("vault.backupPassphrase")} hint={t("vault.backupPassphraseHint")}>
+          <Input value={pass} type="password" onChange={setPass} {...NO_AUTOCORRECT} />
+        </Field>
+        <Field label={t("vault.backupPassphraseAgain")}>
+          <Input value={again} type="password" onChange={setAgain} {...NO_AUTOCORRECT} />
+        </Field>
+        {mismatch && (
+          <div style={{ fontSize: TEXT.small, color: p.red }}>{t("vault.backupMismatch")}</div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** Pick a backup file, give its passphrase and a name, restore into a NEW vault.
+ *
+ *  Never into an existing one: the core refuses a vault id that is taken, and a
+ *  restore that silently replaced a live vault would be a data-loss feature
+ *  wearing a recovery label. */
+function BackupImport({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [path, setPath] = useState<string | null>(null);
+  const [pass, setPass] = useState("");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const pick = async () => {
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Remora backup", extensions: ["unisshbak"] }],
+      });
+      if (typeof picked === "string") {
+        setPath(picked);
+        if (!name.trim()) {
+          const base = (picked.split(/[/\\]/).pop() || "").replace(/\.[^.]+$/, "");
+          if (base) setName(base);
+        }
+      }
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  const run = async () => {
+    if (!path) return;
+    setBusy(true);
+    try {
+      // The vault id is minted here, not taken from the backup: the bundle
+      // carries the id it had, and reusing it would collide with the vault it
+      // was taken from — restoring alongside the original is the normal case.
+      const vaultId = `${slugName(name)}-${Date.now().toString(36)}`;
+      await api.vaultImportBackup(path, pass, vaultId, name.trim());
+      toast(t("vault.backupRestored"), "ok");
+      onDone();
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      icon="upload"
+      title={t("vault.importBackup")}
+      onClose={onClose}
+      w={440}
+      footer={
+        <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end", width: "100%" }}>
+          <Btn variant="ghost" onClick={onClose} disabled={busy}>
+            {t("common.cancel")}
+          </Btn>
+          <Btn onClick={run} disabled={!path || !pass || !name.trim() || busy}>
+            {busy ? t("vault.backupRestoring") : t("vault.importBackup")}
+          </Btn>
+        </div>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(12) }}>
+        <div style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+          {t("vault.restoreExplain")}
+        </div>
+        <Field label={t("vault.backupFile")}>
+          <div style={{ display: "flex", gap: rem(8), alignItems: "center" }}>
+            <Btn variant="ghost" size="sm" icon="folder" onClick={pick}>
+              {t("vault.chooseFile")}
+            </Btn>
+            <span
+              style={{
+                fontSize: TEXT.small,
+                fontFamily: MONO,
+                color: path ? p.txt2 : p.txt3,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {path ?? t("vault.noFileChosen")}
+            </span>
+          </div>
+        </Field>
+        <Field label={t("vault.backupPassphrase")}>
+          <Input value={pass} type="password" onChange={setPass} {...NO_AUTOCORRECT} />
+        </Field>
+        <Field label={t("vault.restoreAsName")}>
+          <Input value={name} onChange={setName} {...NO_AUTOCORRECT} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/** Vault ids are path-safe slugs; a restored vault gets one from its new name. */
+function slugName(s: string): string {
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "vault"
+  );
+}
+
+function IntegrityResult({
+  vault,
+  report,
+  onClose,
+}: {
+  vault: string;
+  report: VaultIntegrityReport;
+  onClose: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  return (
+    <Modal
+      icon={report.ok ? "shieldcheck" : "alert"}
+      iconColor={report.ok ? p.green : p.red}
+      title={t(report.ok ? "vault.integrityOkTitle" : "vault.integrityFailedTitle")}
+      subtitle={vault}
+      onClose={onClose}
+      w={460}
+      footer={
+        <div style={{ display: "flex", justifyContent: "flex-end", width: "100%" }}>
+          <Btn onClick={onClose}>{t("common.done")}</Btn>
+        </div>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(12), fontSize: TEXT.base }}>
+        <div style={{ color: p.txt2 }}>
+          {t(report.ok ? "vault.integrityOk" : "vault.integrityFailed", {
+            count: report.ok
+              ? report.checked
+              : report.issues.length,
+          })}
+        </div>
+        {/* Named, not counted. "3 issues" tells you to worry; the item and
+            the way it failed tells you what to do. */}
+        {report.issues.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: rem(6),
+              maxHeight: rem(260),
+              overflowY: "auto",
+            }}
+          >
+            {report.issues.map((it) => (
+              <div
+                key={`${it.itemId}-${it.version}`}
+                style={{
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: rem(8),
+                  padding: `${rem(8)} ${rem(10)}`,
+                  borderRadius: 8,
+                  background: p.bg2,
+                  border: `1px solid ${p.line}`,
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: TEXT.small,
+                    color: p.txt,
+                    flex: 1,
+                    minWidth: 0,
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {it.itemId}
+                </span>
+                <span style={{ fontSize: TEXT.micro, color: p.txt3, flexShrink: 0 }}>
+                  v{it.version}
+                  {it.tombstone ? ` · ${t("vault.integrityDeleted")}` : ""}
+                </span>
+                <span style={{ fontSize: TEXT.micro, color: p.red, flexShrink: 0 }}>
+                  {t(`vault.integrityFailure.${it.failure}`)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ── Cloud / Server ─────────────────────────────────────────────
+/** Read-only key/value row — mirrors AboutRow, with monospace value option. */
+function CloudInfoRow({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
+  const p = usePalette();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: isMobile ? "column" : "row",
+        alignItems: isMobile ? "stretch" : "baseline",
+        gap: isMobile ? rem(2) : rem(10),
+        padding: `${rem(11)} 0`,
+        borderBottom: `1px solid ${p.line}`,
+      }}
+    >
+      <span style={{ width: isMobile ? "auto" : rem(150), flexShrink: 0, fontSize: TEXT.base, color: p.txt3 }}>
+        {k}
+      </span>
+      <span
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontSize: TEXT.base,
+          color: p.txt,
+          fontFamily: mono ? MONO : UI,
+          wordBreak: "break-all",
+        }}
+      >
+        {v}
+      </span>
+    </div>
+  );
+}
+
+// Small labelled text field used throughout the connect form.
+function ConnectField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  mono,
+  type,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  mono?: boolean;
+  type?: "text" | "password";
+}) {
+  const p = usePalette();
+  return (
+    <label style={{ display: "block" }}>
+      <div style={{ fontSize: TEXT.small, fontWeight: 600, color: p.txt2, marginBottom: rem(6) }}>{label}</div>
+      <input
+        {...NO_AUTOCORRECT}
+        type={type ?? "text"}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={inputStyle(p, mono)}
+      />
+    </label>
+  );
+}
+
+// After a server is linked/joined via Settings, run the SAME post-session sequence
+// as every other session-establishing path (boot / Unlock / JoinDevice): refresh the
+// server list, bind any legacy unbound cloud vaults, then pull the account's cloud
+// vaults — so a newly added server's cloud vaults appear without a manual "Sync now"
+// or a restart. reloadServerStatus must complete first (it populates `servers`, which
+// the bind + auto-sync steps read); cloudAutoSync is fire-and-forget (it reloads the
+// vault list itself once its pass finishes).
+async function pullCloudVaultsAfterConnect(): Promise<void> {
+  const app = useApp.getState();
+  await app.reloadServerStatus();
+  await app.maybeBindLegacyCloudVaults();
+  app.cloudAutoSync();
+  await app.reloadVaults();
+}
+
+// Add-server flow (shown when no server is linked, and to link another). Requires
+// an unlocked instance. One flow: enter the server address → probe it with
+// instanceInfo → an UNCLAIMED instance is set up with a setup code (you become its
+// owner); a CLAIMED instance is joined with an invite link, or signed in to with
+// your existing account keyset.
+function CloudConnectForm({
+  onConnected,
+  onArm,
+}: {
+  onConnected: (s: ServerStatus) => void;
+  // Fired ONLY on a fresh claim/join (not on sign-in / reconnect / SSO, which
+  // recover an already-escrowed identity): the parent arms this identity's keyset
+  // escrow so it can sign in from other devices. Kept separate from onConnected so
+  // the recovery/reconnect paths never re-run it.
+  onArm?: (s: ServerStatus) => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  // Persisted links — the "Reconnect" segment only makes sense when THIS instance is
+  // already linked on this device (server_login targets the active link; with no link
+  // it is a dead entry). Match on the probed instance id below.
+  const servers = useApp((s) => s.servers);
+  const [baseUrl, setBaseUrl] = useState("");
+  const [info, setInfo] = useState<InstanceInfo | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // account profile — applies to claim (owner) and join (new member).
+  const [displayName, setDisplayName] = useState("");
+  const [handle, setHandle] = useState("");
+
+  // claim (unclaimed instance): the one-time setup code + a name for the first Space.
+  const [setupCode, setSetupCode] = useState("");
+  const [spaceName, setSpaceName] = useState("");
+
+  // join a claimed instance: redeem an invite link, sign in with an existing identity
+  // (escrow), restore that identity offline from an Emergency-Kit file, or reconnect the
+  // local keyset.
+  const [branch, setBranch] = useState<"invite" | "identity" | "kit" | "signin">("invite");
+  const [inviteToken, setInviteToken] = useState("");
+  const [preview, setPreview] = useState<JoinPreview | null>(null);
+
+  // "Sign in with existing identity" (escrow): the account handle + password + Secret
+  // Key (Emergency Kit) recover the keyset on this fresh device with no prior link.
+  const [escrowPw, setEscrowPw] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+
+  // "Restore from Emergency Kit" (offline): the encrypted keyset FILE (identity.kit) bytes
+  // + password + Secret Key install the keyset from disk — no server escrow round-trip.
+  const [keysetBytes, setKeysetBytes] = useState<number[] | null>(null);
+  const [kitFileName, setKitFileName] = useState("");
+
+  const optProfile = () => ({
+    displayName: displayName.trim() || undefined,
+    handle: handle.trim() || undefined,
+  });
+
+  // Step 1 → 2: probe the instance so we can branch on claimed/auth.
+  const probe = async () => {
+    const url = baseUrl.trim();
+    if (!url) {
+      toast(t("serverCloud.fillBaseUrl"), "warn");
+      return;
+    }
+    setProbing(true);
+    try {
+      const nfo = await api.instanceInfo(url);
+      setInfo(nfo);
+      setBranch("invite");
+      setPreview(null);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  const back = () => {
+    setInfo(null);
+    setPreview(null);
+  };
+
+  // Read-only invite preview: the spaces (with roles) the token grants. Stateless.
+  const doPreview = async () => {
+    if (!inviteToken.trim()) {
+      toast(t("serverCloud.fillInvite"), "warn");
+      return;
+    }
+    await guard(async () => {
+      setPreview(await api.serverJoinPreview(baseUrl.trim(), inviteToken.trim()));
+    });
+  };
+
+  const doClaim = async () => {
+    if (busy) return;
+    if (!setupCode.trim()) {
+      toast(t("serverCloud.fillSetupCode"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      const status = await api.serverClaim(baseUrl.trim(), {
+        setupCode: setupCode.trim(),
+        spaceName: spaceName.trim() || undefined,
+        ...optProfile(),
+      });
+      toast(t("serverCloud.claimed"), "ok");
+      onConnected(status);
+      onArm?.(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  const doJoin = async () => {
+    if (busy) return;
+    if (!inviteToken.trim()) {
+      toast(t("serverCloud.fillInvite"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      const status = await api.serverJoin(baseUrl.trim(), inviteToken.trim(), optProfile());
+      toast(t("serverCloud.registered"), "ok");
+      onConnected(status);
+      onArm?.(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // Sign in with an existing identity via ESCROW (the fresh-device path). By handle +
+  // password + Secret Key, the server-side keyset escrow is recovered, THIS device is
+  // self-enrolled, and a session + link are established — no invite, no prior link on
+  // this device. This is the session-less keyset link the old TODO tracked.
+  // Zero-knowledge: the password + Secret Key go straight to the Rust command (which
+  // feeds them only into the core to derive K_auth / unwrap the blob); never logged.
+  const doIdentitySignIn = async () => {
+    if (busy) return;
+    if (!handle.trim()) {
+      toast(t("serverCloud.fillHandle"), "warn");
+      return;
+    }
+    if (!secretKey.trim()) {
+      toast(t("serverCloud.fillSecretKey"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      const status = await api.serverEscrowFetchAndUnlock(
+        baseUrl.trim(),
+        handle.trim(),
+        escrowPw ? escrowPw : null,
+        secretKey.replace(/[\s-]/g, ""),
+      );
+      toast(t("serverCloud.signedIn"), "ok");
+      onConnected(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // Pick the Emergency-Kit keyset file (identity.kit) and read its RAW bytes — the encrypted
+  // EncryptedKeyset blob the offline restore installs. Uses the same dialog+fs idiom as the
+  // other import flows (known-hosts, ssh config), but readFile (binary) not readTextFile.
+  const pickKitFile = async () => {
+    await guard(async () => {
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        title: t("serverCloud.kitPickTitle"),
+      });
+      if (!selected || Array.isArray(selected)) return;
+      const bytes = await readFile(selected);
+      setKeysetBytes(Array.from(bytes));
+      setKitFileName(selected.split(/[/\\]/).pop() || selected);
+    });
+  };
+
+  // Restore an existing identity OFFLINE from the Emergency-Kit keyset FILE (the escrow tail
+  // sourced from disk): the kit bytes + password + Secret Key install + unlock the keyset,
+  // THIS device is self-enrolled, and a session + link are established — no server escrow, no
+  // prior link on this device. For recovering when the server's escrow is unavailable, or an
+  // identity that was never escrowed. Zero-knowledge: the bytes + password + Secret Key go
+  // straight to the Rust command (fed only into the core to unwrap the blob); never logged.
+  const doKitRestore = async () => {
+    if (busy) return;
+    if (!keysetBytes) {
+      toast(t("serverCloud.fillKitFile"), "warn");
+      return;
+    }
+    if (!secretKey.trim()) {
+      toast(t("serverCloud.fillSecretKey"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      const status = await api.serverImportKeysetAndUnlock(
+        baseUrl.trim(),
+        keysetBytes,
+        escrowPw ? escrowPw : null,
+        secretKey.replace(/[\s-]/g, ""),
+      );
+      toast(t("serverCloud.signedIn"), "ok");
+      onConnected(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // Reconnect the local account keyset (no invite, no escrow). server_login proves the
+  // keyset and re-establishes the session for an account this device ALREADY belongs to
+  // (a persisted link whose session dropped) — the recovery counterpart to the escrow
+  // "existing identity" path above, which handles a brand-new device with no local link.
+  const doSignIn = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const status = await api.serverLogin();
+      toast(t("serverCloud.signedIn"), "ok");
+      onConnected(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // Sign in with SSO (OIDC browser flow). Opens the system browser to the instance's
+  // IdP; on the loopback redirect the Rust command exchanges the code and runs the
+  // nonce-bound callback. Gated on the probed `auth.includes("oidc")`.
+  const doOidc = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const status = await api.serverOidcLogin(baseUrl.trim());
+      toast(t("serverCloud.signedIn"), "ok");
+      onConnected(status);
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // The probed instance is already linked on this device (a persisted ServerConfig for it
+  // exists) — gates the "Reconnect" action, whose server_login re-auths an existing link.
+  const alreadyLinked = !!info && servers.some((s) => s.connected && s.instanceId === info.instanceId);
+  // The instance advertises OIDC SSO — gates the "Sign in with SSO" action.
+  const hasOidc = !!info && info.auth.includes("oidc");
+
+  // ── Step 1: enter the server address ──────────────────────────
+  if (!info) {
+    return (
+      <>
+        <SectionLabel first>{t("serverCloud.sectionConnect")}</SectionLabel>
+        <div style={{ display: "flex", flexDirection: "column", gap: rem(12), padding: `${rem(16)} 0` }}>
+          <ConnectField
+            label={t("serverCloud.baseUrl")}
+            value={baseUrl}
+            onChange={setBaseUrl}
+            placeholder={t("serverCloud.baseUrlPlaceholder")}
+            mono
+          />
+          <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+            {t("serverCloud.baseUrlHint")}
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <Btn icon={probing ? undefined : "enter"} onClick={probe} disabled={probing}>
+              {probing ? t("serverCloud.probing") : t("serverCloud.continue")}
+            </Btn>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // ── Step 2: instance found — claim / join / sign in ───────────
+  return (
+    <>
+      <SectionLabel first>{t("serverCloud.sectionConnect")}</SectionLabel>
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(12), padding: `${rem(16)} 0` }}>
+        {/* Probed instance summary: name, claimed state, advertised sign-in methods. */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: rem(12),
+            padding: `${rem(12)} ${rem(14)}`,
+            borderRadius: 12,
+            border: `1px solid ${p.line2}`,
+            background: p.bg1,
+          }}
+        >
+          <Icon name="server" size={18} style={{ color: p.accentText, flexShrink: 0 }} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: TEXT.base, fontWeight: 700, color: p.txt }}>
+              {info.name || baseUrl.trim()}
+            </div>
+            <div
+              style={{
+                fontSize: TEXT.small,
+                color: p.txt3,
+                fontFamily: MONO,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {baseUrl.trim()}
+              {info.auth.length ? ` · ${info.auth.join(", ")}` : ""}
+            </div>
+          </div>
+          <span
+            style={{
+              fontSize: TEXT.micro,
+              fontWeight: 700,
+              letterSpacing: rem(0.4),
+              textTransform: "uppercase",
+              color: info.claimed ? p.txt3 : p.green,
+              border: `1px solid ${info.claimed ? p.line2 : rgba(p.green, 0.5)}`,
+              borderRadius: 6,
+              padding: `${rem(1)} ${rem(6)}`,
+              flexShrink: 0,
+            }}
+          >
+            {info.claimed ? t("serverCloud.instanceClaimed") : t("serverCloud.instanceUnclaimed")}
+          </span>
+          <Btn variant="ghost" size="sm" onClick={back} disabled={busy}>
+            {t("serverCloud.changeServer")}
+          </Btn>
+        </div>
+
+        {!info.claimed ? (
+          // Unclaimed → set up as owner with the printed setup code.
+          <>
+            <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+              {t("serverCloud.setupCodeHint")}
+            </div>
+            <ConnectField
+              label={t("serverCloud.setupCode")}
+              value={setupCode}
+              onChange={setSetupCode}
+              placeholder={t("serverCloud.setupCodePlaceholder")}
+              mono
+            />
+            <ConnectField
+              label={t("serverCloud.spaceName")}
+              value={spaceName}
+              onChange={setSpaceName}
+              placeholder={t("serverCloud.spaceNamePlaceholder")}
+            />
+            <ConnectField
+              label={t("serverCloud.displayName")}
+              value={displayName}
+              onChange={setDisplayName}
+              placeholder={t("serverCloud.displayNamePlaceholder")}
+            />
+            <ConnectField
+              label={t("serverCloud.handle")}
+              value={handle}
+              onChange={setHandle}
+              placeholder={t("serverCloud.handlePlaceholder")}
+              mono
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <Btn icon={busy ? undefined : "enter"} onClick={doClaim} disabled={busy}>
+                {busy ? t("serverCloud.connecting") : t("serverCloud.claimCta")}
+              </Btn>
+            </div>
+          </>
+        ) : (
+          // Claimed → join with an invite link, or sign in with the local keyset.
+          <>
+            <Segmented<"invite" | "identity" | "kit" | "signin">
+              value={branch}
+              onChange={(v) => {
+                setBranch(v);
+                setPreview(null);
+              }}
+              options={[
+                { value: "invite", label: t("serverCloud.branchInvite") },
+                { value: "identity", label: t("serverCloud.branchIdentity") },
+                { value: "kit", label: t("serverCloud.branchKit") },
+                // "Reconnect" re-auths an existing link (server_login) — only when this
+                // instance is already linked here; when it isn't but the server advertises
+                // SSO, the same segment carries the (fresh-device) SSO sign-in instead.
+                // Hidden entirely when neither applies, so no dead entry shows.
+                ...(alreadyLinked || hasOidc
+                  ? [
+                      {
+                        value: "signin" as const,
+                        label: alreadyLinked
+                          ? t("serverCloud.branchSignIn")
+                          : t("serverCloud.branchSso"),
+                      },
+                    ]
+                  : []),
+              ]}
+            />
+
+            {branch === "invite" ? (
+              <>
+                <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+                  {t("serverCloud.inviteLinkHint")}
+                </div>
+                <ConnectField
+                  label={t("serverCloud.inviteLink")}
+                  value={inviteToken}
+                  onChange={(v) => {
+                    setInviteToken(v);
+                    setPreview(null);
+                  }}
+                  placeholder={t("serverCloud.inviteLinkPlaceholder")}
+                  mono
+                />
+                <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+                  <Btn variant="ghost" size="sm" icon="eye" onClick={doPreview} disabled={busy}>
+                    {t("serverCloud.preview")}
+                  </Btn>
+                </div>
+                {preview && (
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: rem(6),
+                      padding: `${rem(10)} ${rem(12)}`,
+                      borderRadius: 10,
+                      border: `1px solid ${p.line2}`,
+                      background: p.bg2,
+                    }}
+                  >
+                    {preview.instanceName && (
+                      <div style={{ fontSize: TEXT.base, fontWeight: 700, color: p.txt }}>
+                        {preview.instanceName}
+                      </div>
+                    )}
+                    {preview.spaces.length === 0 ? (
+                      <div style={{ fontSize: TEXT.small, color: p.txt3 }}>
+                        {t("serverCloud.previewNoSpaces")}
+                      </div>
+                    ) : (
+                      preview.spaces.map((sp) => (
+                        <div
+                          key={sp.spaceId}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: rem(8),
+                            fontSize: TEXT.base,
+                            color: p.txt2,
+                          }}
+                        >
+                          <Icon name="cloud" size={13} style={{ color: p.txt3 }} />
+                          <span style={{ flex: 1, minWidth: 0 }}>{sp.name || sp.spaceId}</span>
+                          <span style={{ fontSize: TEXT.micro, color: p.txt3 }}>{sp.role}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+                <ConnectField
+                  label={t("serverCloud.displayName")}
+                  value={displayName}
+                  onChange={setDisplayName}
+                  placeholder={t("serverCloud.displayNamePlaceholder")}
+                />
+                <ConnectField
+                  label={t("serverCloud.handle")}
+                  value={handle}
+                  onChange={setHandle}
+                  placeholder={t("serverCloud.handlePlaceholder")}
+                  mono
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <Btn icon={busy ? undefined : "enter"} onClick={doJoin} disabled={busy}>
+                    {busy ? t("serverCloud.connecting") : t("serverCloud.joinCta")}
+                  </Btn>
+                </div>
+              </>
+            ) : branch === "identity" ? (
+              <>
+                <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+                  {t("serverCloud.identityHint")}
+                </div>
+                <ConnectField
+                  label={t("serverCloud.handle")}
+                  value={handle}
+                  onChange={setHandle}
+                  placeholder={t("serverCloud.handlePlaceholder")}
+                  mono
+                />
+                <ConnectField
+                  label={t("serverCloud.identityPassword")}
+                  value={escrowPw}
+                  onChange={setEscrowPw}
+                  placeholder={t("serverCloud.identityPasswordPlaceholder")}
+                  type="password"
+                />
+                <ConnectField
+                  label={t("serverCloud.identitySecretKey")}
+                  value={secretKey}
+                  onChange={setSecretKey}
+                  placeholder={t("serverCloud.identitySecretKeyPlaceholder")}
+                  type="password"
+                  mono
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <Btn
+                    icon={busy ? undefined : "unlock"}
+                    onClick={doIdentitySignIn}
+                    disabled={busy}
+                  >
+                    {busy ? t("serverCloud.connecting") : t("serverCloud.identityCta")}
+                  </Btn>
+                </div>
+              </>
+            ) : branch === "kit" ? (
+              <>
+                <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+                  {t("serverCloud.kitHint")}
+                </div>
+                <div>
+                  <div style={{ fontSize: TEXT.small, fontWeight: 600, color: p.txt2, marginBottom: rem(6) }}>
+                    {t("serverCloud.kitFile")}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+                    <Btn
+                      variant="ghost"
+                      size="sm"
+                      icon="folder"
+                      onClick={pickKitFile}
+                      disabled={busy}
+                    >
+                      {t("serverCloud.kitChooseFile")}
+                    </Btn>
+                    <span
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        fontSize: TEXT.base,
+                        fontFamily: MONO,
+                        color: kitFileName ? p.txt2 : p.txt3,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {kitFileName || t("serverCloud.kitNoFile")}
+                    </span>
+                  </div>
+                </div>
+                <ConnectField
+                  label={t("serverCloud.identityPassword")}
+                  value={escrowPw}
+                  onChange={setEscrowPw}
+                  placeholder={t("serverCloud.identityPasswordPlaceholder")}
+                  type="password"
+                />
+                <ConnectField
+                  label={t("serverCloud.identitySecretKey")}
+                  value={secretKey}
+                  onChange={setSecretKey}
+                  placeholder={t("serverCloud.identitySecretKeyPlaceholder")}
+                  type="password"
+                  mono
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <Btn icon={busy ? undefined : "unlock"} onClick={doKitRestore} disabled={busy}>
+                    {busy ? t("serverCloud.connecting") : t("serverCloud.kitCta")}
+                  </Btn>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Reconnect the local keyset — only for an already-linked instance. */}
+                {alreadyLinked && (
+                  <>
+                    <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+                      {t("serverCloud.signInHint")}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                      <Btn icon={busy ? undefined : "unlock"} onClick={doSignIn} disabled={busy}>
+                        {busy ? t("serverCloud.connecting") : t("serverCloud.signInCta")}
+                      </Btn>
+                    </div>
+                  </>
+                )}
+                {hasOidc && (
+                  <>
+                    {/* The "or" separator only makes sense above another option. */}
+                    {alreadyLinked && (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: rem(10),
+                          color: p.txt3,
+                          fontSize: TEXT.small,
+                          textTransform: "uppercase",
+                          letterSpacing: rem(0.4),
+                          margin: `${rem(2)} 0`,
+                        }}
+                      >
+                        <span style={{ flex: 1, height: 1, background: p.line2 }} />
+                        {t("serverCloud.ssoOr")}
+                        <span style={{ flex: 1, height: 1, background: p.line2 }} />
+                      </div>
+                    )}
+                    <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+                      {t("serverCloud.ssoHint")}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                      <Btn
+                        variant="ghost"
+                        icon={busy ? undefined : "enter"}
+                        onClick={doOidc}
+                        disabled={busy}
+                      >
+                        {busy ? t("serverCloud.connecting") : t("serverCloud.ssoCta")}
+                      </Btn>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+// Lists the account's own devices (GET /v1/devices), with revoke. The current
+// device is badged and can't revoke itself (that would kill this session).
+function CloudDevicesList({ currentDeviceId }: { currentDeviceId: string | null }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const { fmtDate } = useFmt();
+  const setConfirm = useApp((s) => s.setConfirm);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const load = async () => {
+    try {
+      setDevices(await api.serverListDevices());
+    } catch {
+      // Additive + tolerant: a server that predates GET /v1/devices (not yet
+      // redeployed), or an offline/locked instance, just yields no list — never a
+      // noisy error toast on every Cloud-settings open.
+      setDevices([]);
+    } finally {
+      setLoaded(true);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const revoke = (d: DeviceInfo) => {
+    setConfirm({
+      title: t("serverCloud.revokeDeviceTitle"),
+      body: t("serverCloud.revokeDeviceBody"),
+      danger: true,
+      confirmLabel: t("serverCloud.revokeDevice"),
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.serverDeviceRevoke(d.deviceId);
+          toast(t("serverCloud.revokeDeviceDone"), "ok");
+          await load();
+        });
+      },
+    });
+  };
+
+  if (!loaded || devices.length === 0) return null;
+  return (
+    <div style={{ marginTop: rem(4) }}>
+      {devices.map((d) => {
+        const isCurrent = !!currentDeviceId && d.deviceId === currentDeviceId;
+        const revoked = d.status !== "active";
+        return (
+          <div
+            key={d.deviceId}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: rem(10),
+              padding: `${rem(11)} 0`,
+              borderBottom: `1px solid ${p.line}`,
+              opacity: revoked ? 0.55 : 1,
+            }}
+          >
+            <Icon name="server" size={16} color={isCurrent ? p.accentText : p.txt3} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: rem(7) }}>
+                <span
+                  style={{
+                    fontSize: TEXT.base,
+                    fontFamily: MONO,
+                    color: p.txt,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={d.deviceId}
+                >
+                  {d.deviceId.slice(0, 16)}…
+                </span>
+                {isCurrent && <Tag>{t("serverCloud.thisDevice")}</Tag>}
+              </div>
+              <div style={{ fontSize: TEXT.micro, color: p.txt3 }}>
+                {t("serverCloud.deviceRegistered", { date: fmtDate(d.registeredAt) })}
+                {" · "}
+                {t("serverCloud.deviceSessions", { n: d.activeSessions })}
+                {revoked ? ` · ${t("serverCloud.deviceRevoked")}` : ""}
+              </div>
+            </div>
+            {!isCurrent && !revoked && (
+              <Btn
+                variant="ghost"
+                size="sm"
+                icon="trash"
+                title={t("serverCloud.revokeDevice")}
+                onClick={() => revoke(d)}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Add-device pairing card. serverOnboardComplete BLOCKS until the new device
+// joins, so we run it without blocking the UI and show a "waiting…" spinner.
+function PairingCard({ onClose }: { onClose: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [payload, setPayload] = useState<PairingPayload | null>(null);
+  const [waiting, setWaiting] = useState(false);
+  const [done, setDone] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const pl = await api.serverOnboardInitiate();
+        if (!alive) return;
+        setPayload(pl);
+        setWaiting(true);
+        // Fire-and-forget: this resolves only once the new device joins.
+        api
+          .serverOnboardComplete(pl.channelId, pl.oobCode)
+          .then(() => {
+            if (!alive) return;
+            setWaiting(false);
+            setDone(true);
+            toast(t("serverCloud.pairingDone"), "ok");
+            void useApp.getState().reloadServerStatus();
+          })
+          .catch((e) => {
+            if (!alive) return;
+            setWaiting(false);
+            toast(apiErrorMessage(e), "err");
+          });
+      } catch (e) {
+        if (alive) toast(apiErrorMessage(e), "err");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const payloadText = payload
+    ? [
+        `baseUrl: ${payload.baseUrl}`,
+        `instanceId: ${payload.instanceId}`,
+        `spaceId: ${payload.spaceId}`,
+        `accountId: ${payload.accountId}`,
+        `deviceId: ${payload.deviceId}`,
+        `channelId: ${payload.channelId}`,
+        `oobCode: ${payload.oobCode}`,
+      ].join("\n")
+    : "";
+
+  const copy = async () => {
+    await guard(async () => {
+      // Pairing payload carries the OOB code (device-onboarding secret) →
+      // auto-clear from the clipboard like other secrets.
+      await writeSecretToClipboard(payloadText);
+      toast(t("serverCloud.pairingCopied"), "ok");
+    });
+  };
+
+  return (
+    <div
+      style={{
+        marginTop: rem(12),
+        padding: rem(16),
+        borderRadius: 12,
+        border: `1px solid ${p.line2}`,
+        background: p.bg1,
+        display: "flex",
+        flexDirection: "column",
+        gap: rem(11),
+      }}
+    >
+      <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("serverCloud.pairingTitle")}</div>
+      <div style={{ fontSize: TEXT.base, color: p.txt3 }}>{t("serverCloud.pairingHint")}</div>
+      <textarea
+        readOnly
+        value={payloadText}
+        spellCheck={false}
+        style={{
+          width: "100%",
+          minHeight: rem(132),
+          resize: "vertical",
+          padding: rem(12),
+          borderRadius: 8,
+          background: p.bg0,
+          border: `1px solid ${p.line2}`,
+          outline: "none",
+          fontFamily: MONO,
+          fontSize: TEXT.small,
+          lineHeight: 1.5,
+          color: p.txt,
+          boxSizing: "border-box",
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10) }}>
+        {waiting && (
+          <span style={{ display: "flex", alignItems: "center", gap: rem(8), color: p.txt2, fontSize: TEXT.base }}>
+            <Spinner size={14} />
+            {t("serverCloud.pairingWaiting")}
+          </span>
+        )}
+        {done && (
+          <span style={{ display: "flex", alignItems: "center", gap: rem(6), color: p.green, fontSize: TEXT.base }}>
+            <Icon name="check" size={14} color={p.green} />
+            {t("serverCloud.pairingDone")}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        <Btn variant="ghost" size="sm" icon="copy" onClick={copy} disabled={!payload}>
+          {t("serverCloud.pairingCopy")}
+        </Btn>
+        <Btn variant="ghost" size="sm" onClick={onClose}>
+          {done ? t("common.done") : t("serverCloud.pairingCancel")}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+// Edit display name / handle.
+function CloudProfileForm({ status, onClose }: { status: ServerStatus; onClose: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [displayName, setDisplayName] = useState("");
+  const [handle, setHandle] = useState(status.handle ?? "");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api.serverAccountProfile(displayName.trim() || null, handle.trim() || null);
+      await useApp.getState().reloadServerStatus();
+      toast(t("serverCloud.profileSaved"), "ok");
+      onClose();
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        marginTop: rem(12),
+        padding: rem(16),
+        borderRadius: 12,
+        border: `1px solid ${p.line2}`,
+        background: p.bg1,
+        display: "flex",
+        flexDirection: "column",
+        gap: rem(11),
+      }}
+    >
+      <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("serverCloud.editProfile")}</div>
+      <input
+        {...NO_AUTOCORRECT}
+        value={displayName}
+        onChange={(e) => setDisplayName(e.target.value)}
+        placeholder={t("serverCloud.displayNamePlaceholder")}
+        style={inputStyle(p)}
+      />
+      <input
+        {...NO_AUTOCORRECT}
+        value={handle}
+        onChange={(e) => setHandle(e.target.value)}
+        placeholder={t("serverCloud.handlePlaceholder")}
+        style={inputStyle(p, true)}
+      />
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn size="sm" icon="check" onClick={submit} disabled={busy}>
+          {t("serverCloud.saveProfile")}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+// Inline "enable sign-in on your other devices" step shown right after a claim/join
+// when we can't arm the escrow silently (a master-password account, or a passwordless
+// account whose Secret Key isn't in the keychain). Arming uploads the encrypted keyset
+// + the escrow K_auth derived from (master password?, Secret Key), so the SAME identity
+// can later sign in from the admin panel or another client by handle + Secret Key.
+// The password field appears ONLY for master-password accounts (`requiresPassword !==
+// false`); a passwordless account is armed with password=null. Idempotent — re-arming
+// just re-uploads. Zero-knowledge: the password + Secret Key go straight to the Rust
+// command; never logged, never persisted, cleared once the step closes.
+function ArmEscrowForm({
+  serverId,
+  prefillKey,
+  onClose,
+}: {
+  serverId: string | null;
+  prefillKey?: string;
+  onClose: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  // `requiresPassword === false` is the strict "passwordless" signal used across
+  // Settings (see startupDisabled); anything else keeps the password field so a
+  // master-password account is never armed without its password.
+  const usesPassword = useApp((s) => s.requiresPassword) !== false;
+  const [password, setPassword] = useState("");
+  const [secretKey, setSecretKey] = useState(prefillKey ?? "");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (busy) return;
+    if (!secretKey.trim()) {
+      toast(t("serverCloud.fillSecretKey"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.serverKeysetPush(
+        usesPassword && password ? password : null,
+        secretKey.replace(/[\s-]/g, ""),
+        serverId ?? undefined,
+      );
+      toast(t("serverCloud.armEscrowDone"), "ok");
+      setPassword("");
+      setSecretKey("");
+      onClose();
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      style={{
+        marginTop: rem(12),
+        padding: rem(16),
+        borderRadius: 12,
+        border: `1px solid ${p.line2}`,
+        background: p.bg1,
+        display: "flex",
+        flexDirection: "column",
+        gap: rem(11),
+      }}
+    >
+      <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("serverCloud.armEscrowFormTitle")}</div>
+      <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5 }}>
+        {t("serverCloud.armEscrowHint")}
+      </div>
+      {usesPassword && (
+        <ConnectField
+          label={t("serverCloud.armEscrowPasswordLabel")}
+          value={password}
+          onChange={setPassword}
+          placeholder={t("serverCloud.armEscrowPasswordPlaceholder")}
+          type="password"
+        />
+      )}
+      <ConnectField
+        label={t("serverCloud.armEscrowSecretKeyLabel")}
+        value={secretKey}
+        onChange={setSecretKey}
+        placeholder={t("serverCloud.armEscrowSecretKeyPlaceholder")}
+        type="password"
+        mono
+      />
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={onClose} disabled={busy}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn size="sm" icon="shieldcheck" onClick={submit} disabled={busy}>
+          {t("serverCloud.armEscrowSubmit")}
+        </Btn>
+      </div>
+    </form>
+  );
+}
+
+// Audit log subsection — admin-only; tolerate a forbidden error gracefully.
+function CloudAuditLog() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const { fmtDate } = useFmt();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const [entries, setEntries] = useState<AuditEntry[]>([]);
+  const [forbidden, setForbidden] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  const load = async () => {
+    try {
+      const rows = await api.serverAuditQuery();
+      setEntries(rows);
+      setForbidden(false);
+    } catch (e) {
+      if (isServerErrorCode(e, "forbidden")) {
+        setForbidden(true);
+      } else {
+        toast(apiErrorMessage(e), "err");
+      }
+    } finally {
+      setLoaded(true);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  return (
+    <>
+      <SectionLabel>{t("serverCloud.sectionAudit")}</SectionLabel>
+      <SettingRow title={t("serverCloud.sectionAudit")} desc={t("serverCloud.auditDesc")}>
+        <Btn variant="ghost" size="sm" icon="refresh" onClick={load}>
+          {t("serverCloud.auditRefresh")}
+        </Btn>
+      </SettingRow>
+      {forbidden ? (
+        <div style={{ fontSize: TEXT.base, color: p.txt3, padding: `${rem(10)} 0` }}>
+          {t("serverCloud.auditForbidden")}
+        </div>
+      ) : loaded && entries.length === 0 ? (
+        <div style={{ fontSize: TEXT.base, color: p.txt3, padding: `${rem(10)} 0` }}>
+          {t("serverCloud.auditEmpty")}
+        </div>
+      ) : (
+        <div style={{ marginTop: rem(8) }}>
+          {!isMobile && (
+            <div
+              style={{
+                display: "flex",
+                gap: rem(10),
+                padding: `${rem(7)} 0`,
+                fontSize: TEXT.micro,
+                fontWeight: 700,
+                letterSpacing: rem(0.4),
+                color: p.txt3,
+                textTransform: "uppercase",
+                borderBottom: `1px solid ${p.line}`,
+              }}
+            >
+              <span style={{ width: rem(56) }}>{t("serverCloud.auditSeq")}</span>
+              <span style={{ width: rem(110) }}>{t("serverCloud.auditSource")}</span>
+              <span style={{ flex: 1 }}>{t("serverCloud.auditRecordedAt")}</span>
+              <span style={{ width: rem(130) }}>{t("serverCloud.auditAuthor")}</span>
+            </div>
+          )}
+          {entries.map((a) =>
+            isMobile ? (
+              <div
+                key={a.seq}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: rem(3),
+                  padding: `${rem(10)} 0`,
+                  fontSize: TEXT.base,
+                  borderBottom: `1px solid ${p.line}`,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "baseline", gap: rem(8) }}>
+                  <span style={{ fontFamily: MONO, color: p.txt3 }}>{a.seq}</span>
+                  <span style={{ fontWeight: 700, color: p.txt2 }}>{a.source}</span>
+                </div>
+                <div style={{ color: p.txt2 }}>{fmtDate(a.recordedAt)}</div>
+                <div
+                  style={{
+                    fontFamily: MONO,
+                    color: p.txt3,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={a.authorPubkey ?? ""}
+                >
+                  {a.authorPubkey ? a.authorPubkey.slice(0, 12) + "…" : "—"}
+                </div>
+              </div>
+            ) : (
+              <div
+                key={a.seq}
+                style={{
+                  display: "flex",
+                  gap: rem(10),
+                  padding: `${rem(8)} 0`,
+                  fontSize: TEXT.base,
+                  borderBottom: `1px solid ${p.line}`,
+                }}
+              >
+                <span style={{ width: rem(56), fontFamily: MONO, color: p.txt3 }}>{a.seq}</span>
+                <span style={{ width: rem(110), color: p.txt2 }}>{a.source}</span>
+                <span style={{ flex: 1, color: p.txt2 }}>{fmtDate(a.recordedAt)}</span>
+                <span
+                  style={{
+                    width: rem(130),
+                    fontFamily: MONO,
+                    color: p.txt3,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={a.authorPubkey ?? ""}
+                >
+                  {a.authorPubkey ? a.authorPubkey.slice(0, 12) + "…" : "—"}
+                </span>
+              </div>
+            ),
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+// Members panel for the currently-selected cloud vault.
+function CloudMembersPanel({ vault }: { vault: VaultInfo }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const setConfirm = useApp((s) => s.setConfirm);
+  const [members, setMembers] = useState<MemberInfo[]>([]);
+  const [accounts, setAccounts] = useState<AccountInfo[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [ed, setEd] = useState("");
+  const [x, setX] = useState("");
+  const [role, setRole] = useState<MemberRole>("viewer");
+  const [busy, setBusy] = useState(false);
+  // #14: a vault that holds identities/bindings must stay single-member (they must
+  // never sync to another member). Block adding a member to any such vault. (The core
+  // also refuses to WRITE an identity into a multi-member vault — save_identity.)
+  const [hasIdentities, setHasIdentities] = useState(false);
+
+  const roleLabel = (r: MemberRole) =>
+    r === "admin"
+      ? t("serverCloud.roleAdmin")
+      : r === "editor"
+        ? t("serverCloud.roleEditor")
+        : t("serverCloud.roleViewer");
+
+  const load = async () => {
+    await guard(async () => {
+      const ms = await api.serverListMembers(vault.vaultId);
+      setMembers(ms);
+    });
+    // Account list is admin-only — tolerate a forbidden error silently.
+    try {
+      setAccounts(await api.serverListAccounts());
+    } catch {
+      setAccounts([]);
+    }
+    try {
+      const its = await api.listItems(vault.vaultId);
+      setHasIdentities(its.some((i) => i.itemType === ItemType.Identity));
+    } catch {
+      setHasIdentities(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vault.vaultId]);
+
+  const doAddMember = async () => {
+    setBusy(true);
+    try {
+      await guard(async () => {
+        await api.serverAddMember(vault.vaultId, ed.trim(), x.trim(), role);
+        toast(t("serverCloud.memberAdded"), "ok");
+        setEd("");
+        setX("");
+        setAdding(false);
+        await load();
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const addMember = () => {
+    if (busy) return;
+    if (!ed.trim() || !x.trim()) {
+      toast(t("serverCloud.fillMemberKeys"), "warn");
+      return;
+    }
+    // #14: never add a member to a vault holding identities — their private keys +
+    // bindings would then sync to the new member.
+    if (hasIdentities) {
+      toast(t("serverCloud.cantAddToPersonal"), "err");
+      return;
+    }
+    // B5.3(c): adding a member VK-shares EVERY existing secret in this vault with
+    // them retroactively — confirm before that irreversible share.
+    setConfirm({
+      title: t("serverCloud.addMemberConfirmTitle"),
+      body: t("serverCloud.addMemberConfirmBody"),
+      confirmLabel: t("serverCloud.addMemberConfirmCta"),
+      icon: "users",
+      onConfirm: () => {
+        void doAddMember();
+      },
+    });
+  };
+
+  const pickAccount = (id: string) => {
+    const a = accounts.find((acc) => acc.accountId === id);
+    if (a) {
+      setEd(a.ed25519PubHex ?? "");
+      setX(a.x25519PubHex ?? "");
+    }
+  };
+
+  const confirmPin = async (ed25519PubHex: string) => {
+    // The pin is keyed on the member's account id (per-account anti-substitution).
+    // Without it (non-admins can't list accounts) we must NOT pin under an empty
+    // id — that corrupts the pin table. Require the account context.
+    const acc = accounts.find((a) => a.ed25519PubHex === ed25519PubHex);
+    if (!acc?.accountId) {
+      toast(t("serverCloud.pinNeedsAccount"), "warn");
+      return;
+    }
+    await guard(async () => {
+      await api.serverConfirmMemberPin(acc.accountId, ed25519PubHex);
+      toast(t("serverCloud.pinConfirmed"), "ok");
+    });
+  };
+
+  const rotateVk = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await guard(async () => {
+        // Rebuild the remaining-member set from the current members + their keys.
+        const remaining = members
+          .map((m) => {
+            const acc = accounts.find((a) => a.ed25519PubHex === m.ed25519PubHex);
+            return acc?.x25519PubHex
+              ? { ed25519PubHex: m.ed25519PubHex, x25519PubHex: acc.x25519PubHex, role: m.role }
+              : null;
+          })
+          .filter((r): r is NonNullable<typeof r> => r !== null);
+        const epoch = await api.serverRotateVk(vault.vaultId, remaining);
+        toast(t("serverCloud.rotateVkConfirmed", { epoch }), "ok");
+        await load();
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <SectionLabel>{t("serverCloud.members")}</SectionLabel>
+      <div style={{ fontSize: TEXT.base, color: p.txt3, margin: `${rem(6)} 0 ${rem(8)}` }}>
+        {t("serverCloud.membersDesc")}
+      </div>
+      {members.length === 0 ? (
+        <div style={{ fontSize: TEXT.base, color: p.txt3, padding: `${rem(8)} 0` }}>
+          {t("serverCloud.membersEmpty")}
+        </div>
+      ) : (
+        members.map((m) => (
+          <div
+            key={m.ed25519PubHex}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: rem(10),
+              padding: `${rem(12)} 0`,
+              borderBottom: `1px solid ${p.line}`,
+            }}
+          >
+            <Icon name="fingerprint" size={16} color={p.txt3} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: TEXT.base,
+                  fontFamily: MONO,
+                  color: p.txt,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+                title={m.ed25519PubHex}
+              >
+                {m.ed25519PubHex.slice(0, 20)}…
+              </div>
+              <div style={{ fontSize: TEXT.micro, color: p.txt3, fontFamily: MONO }}>{m.fingerprint}</div>
+            </div>
+            <Tag>{roleLabel(m.role)}</Tag>
+            <Btn
+              variant="ghost"
+              size="sm"
+              icon="check"
+              title={t("serverCloud.confirmPin")}
+              disabled={!accounts.find((a) => a.ed25519PubHex === m.ed25519PubHex)?.accountId}
+              onClick={() => confirmPin(m.ed25519PubHex)}
+            />
+          </div>
+        ))
+      )}
+
+      {adding ? (
+        <div
+          style={{
+            marginTop: rem(12),
+            padding: rem(16),
+            borderRadius: 12,
+            border: `1px solid ${p.line2}`,
+            background: p.bg1,
+            display: "flex",
+            flexDirection: "column",
+            gap: rem(11),
+          }}
+        >
+          <div style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("serverCloud.addMember")}</div>
+          {accounts.length > 0 && (
+            <select
+              onChange={(e) => pickAccount(e.target.value)}
+              defaultValue=""
+              style={{ ...inputStyle(p), appearance: "none", cursor: "pointer" }}
+            >
+              <option value="">{t("serverCloud.pickAccount")}</option>
+              {accounts.map((a) => (
+                <option key={a.accountId} value={a.accountId}>
+                  {a.handle ?? a.displayName ?? a.accountId}
+                </option>
+              ))}
+            </select>
+          )}
+          <input
+            {...NO_AUTOCORRECT}
+            value={ed}
+            onChange={(e) => setEd(e.target.value)}
+            placeholder={t("serverCloud.memberEd25519Placeholder")}
+            style={inputStyle(p, true)}
+          />
+          <input
+            {...NO_AUTOCORRECT}
+            value={x}
+            onChange={(e) => setX(e.target.value)}
+            placeholder={t("serverCloud.memberX25519Placeholder")}
+            style={inputStyle(p, true)}
+          />
+          <div>
+            <div style={{ fontSize: TEXT.small, fontWeight: 600, color: p.txt2, marginBottom: rem(6) }}>
+              {t("serverCloud.memberRole")}
+            </div>
+            <Segmented<MemberRole>
+              value={role}
+              onChange={setRole}
+              options={[
+                { value: "viewer", label: t("serverCloud.roleViewer") },
+                { value: "editor", label: t("serverCloud.roleEditor") },
+                { value: "admin", label: t("serverCloud.roleAdmin") },
+              ]}
+            />
+          </div>
+          <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+            <Btn variant="ghost" size="sm" onClick={() => setAdding(false)} disabled={busy}>
+              {t("common.cancel")}
+            </Btn>
+            <Btn size="sm" icon="check" onClick={addMember} disabled={busy}>
+              {t("common.add")}
+            </Btn>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: rem(10), marginTop: rem(14) }}>
+          <Btn icon="plus" size="sm" onClick={() => setAdding(true)}>
+            {t("serverCloud.addMember")}
+          </Btn>
+          <Btn variant="ghost" size="sm" icon="refresh" onClick={rotateVk} disabled={busy}>
+            {t("serverCloud.rotateVk")}
+          </Btn>
+        </div>
+      )}
+    </>
+  );
+}
+
+// A short, human-friendly label for a linked server (host of the base URL).
+function serverLabel(s: ServerStatus): string {
+  const base = s.baseUrl ?? "";
+  try {
+    return new URL(base).host || base;
+  } catch {
+    return base || s.serverId || "—";
+  }
+}
+
+// List of linked cloud servers: switch the active one, remove one, or add another.
+// The detailed session/profile/devices/audit panels below key off the active server.
+function CloudServersList({
+  servers,
+  activeServerId,
+  onAdd,
+}: {
+  servers: ServerStatus[];
+  activeServerId: string | null;
+  onAdd: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const setActiveServer = useApp((s) => s.setActiveServer);
+  const reloadServerStatus = useApp((s) => s.reloadServerStatus);
+  const setConfirm = useApp((s) => s.setConfirm);
+
+  const doRemove = (s: ServerStatus) => {
+    if (!s.serverId) return;
+    setConfirm({
+      title: t("serverCloud.removeServerTitle"),
+      body: t("serverCloud.removeServerBody", { server: serverLabel(s) }),
+      danger: true,
+      confirmLabel: t("serverCloud.removeServer"),
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.serverRemove(s.serverId!);
+          await reloadServerStatus();
+          toast(t("serverCloud.removeServerDone"), "ok");
+        });
+      },
+    });
+  };
+
+  return (
+    <>
+      <SectionLabel first>{t("serverCloud.sectionServers")}</SectionLabel>
+      <div style={{ display: "flex", flexDirection: "column", padding: `${rem(12)} 0` }}>
+        {servers.map((s) => {
+          const isActive = s.serverId === activeServerId;
+          return (
+            <div
+              key={s.serverId ?? s.baseUrl ?? ""}
+              onClick={() => {
+                if (!isActive && s.serverId)
+                  setActiveServer(s.serverId).catch((e) => toast(apiErrorMessage(e), "err"));
+              }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: rem(12),
+                padding: `${rem(12)} 0`,
+                cursor: isActive ? "default" : "pointer",
+                borderBottom: `1px solid ${p.line}`,
+                background: isActive ? p.bg2 : "transparent",
+              }}
+              title={isActive ? undefined : t("serverCloud.switchTo")}
+            >
+              <Icon
+                name="cloud"
+                size={18}
+                style={{ color: isActive ? p.accentText : p.txt3, flexShrink: 0 }}
+              />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: rem(8),
+                    fontSize: TEXT.base,
+                    fontWeight: 600,
+                    color: p.txt,
+                    minWidth: 0, // let the ellipsis label span actually truncate
+                  }}
+                >
+                  <span
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      minWidth: 0,
+                    }}
+                  >
+                    {serverLabel(s)}
+                  </span>
+                  {isActive && (
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: rem(5) }}>
+                      <span
+                        aria-hidden
+                        style={{
+                          width: rem(6),
+                          height: rem(6),
+                          borderRadius: "50%",
+                          background: p.accent,
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span
+                        style={{ fontSize: TEXT.micro, fontWeight: 600, fontFamily: MONO, color: p.txt2 }}
+                      >
+                        {t("serverCloud.activeBadge")}
+                      </span>
+                    </span>
+                  )}
+                  {/* Owner vs member — distinguishes your own space from a joined one
+                      (e.g. two spaces on the same host, which would otherwise look
+                      like two identical "servers"). Role is not a status → neutral
+                      greyscale word, never a coloured pill. */}
+                  <Tag>{t(s.owned ? "serverCloud.roleOwner" : "serverCloud.roleMember")}</Tag>
+                  <Icon
+                    name={s.hasSession ? "shieldcheck" : "alert"}
+                    size={13}
+                    style={{ color: s.hasSession ? p.green : p.amber, flexShrink: 0 }}
+                  />
+                </div>
+                <div
+                  style={{
+                    fontSize: TEXT.small,
+                    color: p.txt3,
+                    fontFamily: MONO,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {s.baseUrl ?? "—"}
+                  {s.handle ? ` · ${s.handle}` : ""}
+                </div>
+              </div>
+              <Btn
+                variant="ghost"
+                size="sm"
+                icon="x"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  doRemove(s);
+                }}
+                style={{ color: p.red, borderColor: rgba(p.red, 0.4), flexShrink: 0 }}
+              >
+                {t("serverCloud.removeServer")}
+              </Btn>
+            </div>
+          );
+        })}
+        <div style={{ display: "flex", justifyContent: "flex-start", marginTop: rem(4) }}>
+          <Btn variant="ghost" size="sm" icon="plus" onClick={onAdd}>
+            {t("serverCloud.addAnotherServer")}
+          </Btn>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function SettingsCloud() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const { fmtDate } = useFmt();
+  const unlocked = useApp((s) => s.unlocked);
+  const servers = useApp((s) => s.servers);
+  const activeServerId = useApp((s) => s.activeServerId);
+  const serverStatus = useApp((s) => s.serverStatus);
+  const syncStatus = useApp((s) => s.syncStatus);
+  const vaults = useApp((s) => s.vaults);
+  const vaultId = useApp((s) => s.vaultId);
+  const reloadServerStatus = useApp((s) => s.reloadServerStatus);
+  const syncNow = useApp((s) => s.syncNow);
+  const repull = useApp((s) => s.repull);
+
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [pairing, setPairing] = useState(false);
+  // The "Add server" form is a persistent entry below the linked-server list.
+  const [addingServer, setAddingServer] = useState(false);
+  // Post-claim/join "enable sign-in on other devices" step: set when we couldn't arm
+  // the escrow silently (master-password account, or a passwordless account with no
+  // keychain Secret Key) → we render the inline ArmEscrowForm, Secret Key pre-filled
+  // when we could read it. Null once armed or dismissed.
+  const [armPrompt, setArmPrompt] = useState<{ serverId: string | null; prefillKey: string } | null>(
+    null,
+  );
+
+  // Refresh server status whenever the Cloud section mounts.
+  useEffect(() => {
+    void reloadServerStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const currentVault = vaults.find((v) => v.vaultId === vaultId);
+
+  // Make a freshly claimed/joined identity recoverable on OTHER devices out of the
+  // box, without extra work for the user. A passwordless account arms fully
+  // automatically from the keychain Secret Key (the same value Settings → Security
+  // reveals) with password=null — zero prompts. A master-password account can't
+  // retain the plaintext password, so we surface a one-time inline step (Secret Key
+  // pre-filled from the keychain; the user types the password once). Non-blocking:
+  // the claim/join already succeeded. Zero-knowledge: the Secret Key only rides the
+  // process cache the keychain already primed; it never lands in a store or a log.
+  const armEscrowAfterConnect = async (status: ServerStatus) => {
+    const serverId = status.serverId;
+    const passwordless = useApp.getState().requiresPassword === false;
+    let key = "";
+    try {
+      const raw = await readSecretKeyOnce();
+      key = raw ? raw.replace(/[\s-]/g, "") : "";
+    } catch {
+      key = "";
+    }
+    if (passwordless && key) {
+      try {
+        await api.serverKeysetPush(null, key, serverId ?? undefined);
+        toast(t("serverCloud.armEscrowDone"), "ok");
+        return;
+      } catch {
+        // Silent arm failed → fall through to the manual step so the user can retry.
+      }
+    }
+    // Master-password account, no keychain Secret Key, or a failed silent arm → the
+    // one-time inline step (Secret Key pre-filled when we could read it).
+    setArmPrompt({ serverId, prefillKey: key });
+  };
+
+  if (!unlocked) {
+    return (
+      <div style={{ fontSize: TEXT.base, color: p.txt3, padding: `${rem(12)} 0` }}>
+        {t("serverCloud.needUnlock")}
+      </div>
+    );
+  }
+
+  // No servers linked yet → straight to the connect form (first link).
+  if (servers.length === 0) {
+    return (
+      <CloudConnectForm
+        onConnected={() => void pullCloudVaultsAfterConnect()}
+        onArm={(st) => void armEscrowAfterConnect(st)}
+      />
+    );
+  }
+
+  // Resolve the active server explicitly so the panels — and the commands below,
+  // which pass s.serverId — never act on a different server than the one shown
+  // (the `serverStatus ?? servers[0]` fallback could otherwise diverge from active).
+  const s = servers.find((x) => x.serverId === activeServerId) ?? serverStatus ?? servers[0];
+
+  const onAddedServer = () => {
+    setAddingServer(false);
+    void pullCloudVaultsAfterConnect();
+  };
+
+  const doSync = async () => {
+    await guard(async () => {
+      await syncNow();
+      const r = useApp.getState().syncStatus.lastReport;
+      if (r) {
+        toast(
+          t("serverCloud.syncDone", {
+            applied: r.applied,
+            pushed: r.pushed,
+            conflicts: r.conflicts,
+            rejected: r.rejected,
+          }),
+          r.conflicts > 0 || r.rejected > 0 ? "warn" : "ok",
+        );
+      }
+    });
+  };
+
+  // Full re-pull of THIS server: reset the pull cursor + sync, so a vault that was
+  // rejected under a prior identity (its seqs already past the cursor) is recovered.
+  const doRepull = async () => {
+    await guard(async () => {
+      await repull(s.serverId ?? undefined);
+      const r = useApp.getState().syncStatus.lastReport;
+      if (r) {
+        toast(
+          t("serverCloud.repullDone", {
+            applied: r.applied,
+            rejected: r.rejected,
+            conflicts: r.conflicts,
+          }),
+          r.conflicts > 0 || r.rejected > 0 ? "warn" : "ok",
+        );
+      }
+    });
+  };
+
+  // Recovery: bring back cloud vaults deleted locally but still live on the server.
+  // A local delete tombstones the vault above the server's version, so LWW won't let
+  // a pull resurrect it and the list hides it. Purge the local tombstone + re-pull.
+  const doRestoreDeleted = async () => {
+    await guard(async () => {
+      const n = await api.serverRestoreDeletedVaults(s.serverId ?? undefined);
+      await useApp.getState().reloadVaults();
+      await reloadServerStatus();
+      toast(
+        n > 0 ? t("serverCloud.restoreDone", { count: n }) : t("serverCloud.restoreNone"),
+        n > 0 ? "ok" : "warn",
+      );
+    });
+  };
+
+  const doRefresh = async () => {
+    await guard(async () => {
+      await api.serverRefreshSession(s.serverId ?? undefined);
+      await reloadServerStatus();
+      // A new session makes the old sync failure stale by definition, and the
+      // status badge is not self-healing: auto-sync only runs when a vault
+      // changes, so nothing would clear "Sync error" until the user happened to
+      // edit something. Re-run the sync — it both answers the question the badge
+      // is now asking and repairs it.
+      await syncNow().catch(() => {
+        /* the badge reports it; a failed retry must not undo the refresh toast */
+      });
+      toast(t("serverCloud.sessionRefreshed"), "ok");
+    });
+  };
+  // Full re-auth via the local keyset (server_login) — for a fully dropped
+  // connection where the refresh token is dead, so "Refresh session" can't help.
+  // Works because the account identity is the keyset, not the session tokens.
+  const doSignIn = async () => {
+    await guard(async () => {
+      await api.serverLogin(s.serverId ?? undefined);
+      await reloadServerStatus();
+      await syncNow().catch(() => {
+        /* see doRefresh: a fresh session makes a stale sync error meaningless */
+      });
+      toast(t("serverCloud.signedIn"), "ok");
+    });
+  };
+
+  const doSignOut = async () => {
+    await guard(async () => {
+      await api.serverLogout(s.serverId ?? undefined);
+      await reloadServerStatus();
+      toast(t("serverCloud.signedOut"), "ok");
+    });
+  };
+
+  const lastSyncStr = syncStatus.lastSyncAt
+    ? fmtDate(Math.floor(syncStatus.lastSyncAt / 1000))
+    : t("serverCloud.lastSyncNever");
+
+  return (
+    <>
+      <CloudServersList
+        servers={servers}
+        activeServerId={activeServerId}
+        onAdd={() => setAddingServer((v) => !v)}
+      />
+      {addingServer && (
+        <div
+          style={{
+            marginTop: rem(4),
+            marginBottom: rem(8),
+            padding: `0 ${rem(14)} ${rem(8)}`,
+            borderRadius: 12,
+            border: `1px solid ${p.line2}`,
+            background: p.bg1,
+          }}
+        >
+          <CloudConnectForm onConnected={onAddedServer} onArm={(st) => void armEscrowAfterConnect(st)} />
+        </div>
+      )}
+
+      {armPrompt && (
+        <div
+          style={{
+            marginTop: rem(8),
+            marginBottom: rem(4),
+            padding: `${rem(13)} ${rem(15)} ${rem(15)}`,
+            borderRadius: 12,
+            border: `1px solid ${rgba(p.accent, 0.5)}`,
+            background: p.accentSoft,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: rem(8),
+              fontSize: TEXT.base,
+              fontWeight: 700,
+            }}
+          >
+            <Icon name="shieldcheck" size={16} color={p.accentText} />
+            {t("serverCloud.armEscrowPromptTitle")}
+          </div>
+          <div style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5, marginTop: rem(4) }}>
+            {t("serverCloud.armEscrowPromptBody")}
+          </div>
+          <ArmEscrowForm
+            serverId={armPrompt.serverId}
+            prefillKey={armPrompt.prefillKey}
+            onClose={() => setArmPrompt(null)}
+          />
+        </div>
+      )}
+
+      <SectionLabel>{t("serverCloud.sectionSession")}</SectionLabel>
+      <SettingRow title={serverLabel(s)}>
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: rem(6),
+            fontSize: TEXT.base,
+            fontWeight: 600,
+            color: s.hasSession ? p.green : p.amber,
+          }}
+        >
+          <Icon name={s.hasSession ? "shieldcheck" : "alert"} size={15} />
+          {s.hasSession ? t("serverCloud.hasSession") : t("serverCloud.noSession")}
+        </span>
+      </SettingRow>
+      <CloudInfoRow k={t("serverCloud.baseUrlRow")} v={s.baseUrl ?? "—"} />
+      <CloudInfoRow k={t("serverCloud.instanceRow")} v={s.instanceId ?? "—"} mono />
+      <CloudInfoRow
+        k={t("serverCloud.spacesRow")}
+        v={
+          s.spaces && s.spaces.length
+            ? s.spaces.map((sp) => `${sp.name || sp.spaceId} (${sp.role})`).join(", ")
+            : "—"
+        }
+      />
+      <CloudInfoRow k={t("serverCloud.accountIdRow")} v={s.accountId ?? "—"} mono />
+      <CloudInfoRow k={t("serverCloud.deviceIdRow")} v={s.deviceId ?? "—"} mono />
+      <CloudInfoRow k={t("serverCloud.handleRow")} v={s.handle ?? "—"} />
+      <CloudInfoRow k={t("serverCloud.lastSync")} v={lastSyncStr} />
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: rem(10), marginTop: rem(16) }}>
+        <Btn
+          icon={syncStatus.syncing ? undefined : "refresh"}
+          onClick={doSync}
+          disabled={syncStatus.syncing || !s.hasSession}
+        >
+          {syncStatus.syncing ? t("serverCloud.syncing") : t("serverCloud.syncNow")}
+        </Btn>
+        <Btn
+          variant="ghost"
+          icon="download"
+          onClick={doRepull}
+          disabled={syncStatus.syncing || !s.hasSession}
+          title={t("serverCloud.pullFromServerHint")}
+        >
+          {t("serverCloud.pullFromServer")}
+        </Btn>
+        <Btn
+          variant="ghost"
+          icon="clock"
+          onClick={doRestoreDeleted}
+          disabled={syncStatus.syncing || !s.hasSession}
+          title={t("serverCloud.restoreDeletedHint")}
+        >
+          {t("serverCloud.restoreDeleted")}
+        </Btn>
+        <Btn variant="ghost" icon="refresh" onClick={doRefresh}>
+          {t("serverCloud.refreshSession")}
+        </Btn>
+        <Btn
+          variant={s.hasSession ? "ghost" : "primary"}
+          icon="unlock"
+          onClick={doSignIn}
+          title={t("serverCloud.signInAgainHint")}
+        >
+          {t("serverCloud.signInAgain")}
+        </Btn>
+      </div>
+
+      <ServerVaultsSection serverId={s.serverId} hasSession={s.hasSession} />
+
+      {syncStatus.lastReport && (
+        <div style={{ fontSize: TEXT.small, color: p.txt3, marginTop: rem(10), display: "flex", gap: rem(12), flexWrap: "wrap" }}>
+          <span>{t("serverCloud.syncReportApplied", { count: syncStatus.lastReport.applied })}</span>
+          <span>{t("serverCloud.syncReportPushed", { count: syncStatus.lastReport.pushed })}</span>
+          <span>{t("serverCloud.syncReportConflicts", { count: syncStatus.lastReport.conflicts })}</span>
+          <span>{t("serverCloud.syncReportRejected", { count: syncStatus.lastReport.rejected })}</span>
+          <span>{t("serverCloud.syncReportSkipped", { count: syncStatus.lastReport.skippedStale })}</span>
+        </div>
+      )}
+
+      <SectionLabel>{t("serverCloud.sectionProfile")}</SectionLabel>
+      <SettingRow title={t("serverCloud.editProfile")} desc={s.handle ?? "—"}>
+        <Btn variant="ghost" size="sm" icon="pencil" onClick={() => setEditingProfile((v) => !v)}>
+          {t("common.edit")}
+        </Btn>
+      </SettingRow>
+      {editingProfile && (
+        <CloudProfileForm
+          key={`profile-${activeServerId ?? ""}`}
+          status={s}
+          onClose={() => setEditingProfile(false)}
+        />
+      )}
+
+      <SectionLabel>{t("serverCloud.sectionDevices")}</SectionLabel>
+      <SettingRow title={t("serverCloud.addDevice")} desc={t("serverCloud.addDeviceDesc")}>
+        <Btn variant="ghost" size="sm" icon="link" onClick={() => setPairing((v) => !v)}>
+          {t("serverCloud.addDevice")}
+        </Btn>
+      </SettingRow>
+      {/* No key={activeServerId} here: a successful join calls reloadServerStatus,
+          which can change activeServerId and would remount this card → its effect
+          re-runs serverOnboardInitiate → a phantom SECOND pairing card. The card
+          is transient and bound to the channel it opened, so a stable identity is
+          correct. */}
+      {pairing && <PairingCard onClose={() => setPairing(false)} />}
+      {/* Key includes `pairing` so the list re-fetches when the add-device card
+          closes (a freshly-joined device then shows up), and activeServerId so it
+          re-fetches on a server switch. Unique prefix avoids sibling-key clashes. */}
+      <CloudDevicesList
+        key={`devices-${activeServerId ?? ""}-${pairing ? 1 : 0}`}
+        currentDeviceId={s.deviceId}
+      />
+
+      {currentVault?.syncTarget === "cloud" ? (
+        <CloudMembersPanel key={`members-${activeServerId ?? ""}`} vault={currentVault} />
+      ) : (
+        <>
+          <SectionLabel>{t("serverCloud.sectionVault")}</SectionLabel>
+          <div style={{ fontSize: TEXT.base, color: p.txt3, padding: `${rem(8)} 0` }}>
+            {t("serverCloud.noCloudVault")}
+          </div>
+        </>
+      )}
+
+      {/* re-key on the active server so the audit log re-fetches on a switch.
+          Keys must be UNIQUE among siblings — sharing the bare activeServerId with
+          the profile/members panels collided and rendered a phantom empty panel. */}
+      <CloudAuditLog key={`audit-${activeServerId ?? ""}`} />
+
+      <div style={{ display: "flex", gap: rem(10), marginTop: rem(26) }}>
+        <Btn variant="ghost" size="sm" icon="unlock" onClick={doSignOut} disabled={!s.hasSession}>
+          {t("serverCloud.signOut")}
+        </Btn>
+      </div>
+    </>
+  );
+}
+
+// ── shell ──────────────────────────────────────────────────────
+type TabId = "shortcuts" | "appearance" | "general" | "vaults" | "cloud" | "security" | "about" | "support";
+const SETTINGS_TABS: { id: TabId; icon: IconName; labelKey: string }[] = [
+  { id: "appearance", icon: "sliders", labelKey: "settings.tabAppearance" },
+  { id: "shortcuts", icon: "command", labelKey: "keybindings.title" },
+  { id: "general", icon: "refresh", labelKey: "settings.tabGeneral" },
+  { id: "vaults", icon: "layers", labelKey: "vault.manage" },
+  { id: "cloud", icon: "cloud", labelKey: "serverCloud.tab" },
+  { id: "security", icon: "shieldcheck", labelKey: "settings.tabSecurity" },
+  { id: "about", icon: "note", labelKey: "settings.tabAbout" },
+  { id: "support", icon: "heart", labelKey: "support.tab" },
+];
+
+export function ViewSettings() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const [tab, setTab] = useState<TabId>("appearance");
+  // Reset the content scroll when switching tabs — otherwise a tab scrolled halfway
+  // down leaves the next tab opening mid-content instead of at its top.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [tab]);
+  const title = tDyn(SETTINGS_TABS.find((tb) => tb.id === tab)?.labelKey ?? "");
+
+  return (
+    <div
+      style={{
+        flex: 1,
+        display: "flex",
+        flexDirection: isMobile ? "column" : "row",
+        minWidth: 0,
+        background: p.bg0,
+      }}
+    >
+      <div
+        style={{
+          width: isMobile ? "100%" : rem(200),
+          flexShrink: 0,
+          borderRight: isMobile ? "none" : `1px solid ${p.line}`,
+          borderBottom: isMobile ? `1px solid ${p.line}` : "none",
+          padding: isMobile ? `${rem(12)}` : `${rem(20)} ${rem(12)}`,
+          display: "flex",
+          flexDirection: isMobile ? "row" : "column",
+          gap: isMobile ? rem(6) : rem(3),
+          overflowX: isMobile ? "auto" : undefined,
+          boxSizing: "border-box",
+        }}
+      >
+        {!isMobile && (
+          <h1
+            style={{ margin: `0 0 ${rem(14)} ${rem(10)}`, fontSize: TEXT.h3, fontWeight: 800, letterSpacing: rem(-0.5) }}
+          >
+            {t("settings.heading")}
+          </h1>
+        )}
+        {SETTINGS_TABS.map((tb) => {
+          const on = tab === tb.id;
+          return (
+            <button
+              key={tb.id}
+              onClick={() => setTab(tb.id)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: rem(10),
+                padding: isMobile ? `${rem(10)} ${rem(14)}` : `${rem(9)} ${rem(11)}`,
+                borderRadius: 8,
+                cursor: "pointer",
+                textAlign: "left",
+                border: "1px solid transparent",
+                background: "transparent",
+                color: on ? p.txt : p.txt2,
+                boxShadow: on
+                  ? isMobile
+                    ? `inset 0 -2px 0 ${p.accent}`
+                    : `inset 2px 0 0 ${p.accent}`
+                  : "none",
+                fontFamily: UI,
+                fontSize: TEXT.base,
+                fontWeight: on ? 700 : 500,
+                whiteSpace: isMobile ? "nowrap" : undefined,
+                flexShrink: isMobile ? 0 : undefined,
+              }}
+            >
+              <Icon name={tb.icon} size={16} color={on ? p.txt : p.txt3} />
+              {tDyn(tb.labelKey)}
+            </button>
+          );
+        })}
+      </div>
+      <div ref={scrollRef} style={{ flex: 1, minWidth: 0, overflow: "auto" }}>
+        <div
+          style={{
+            maxWidth: rem(720),
+            padding: isMobile ? `${rem(18)} ${rem(16)} ${rem(30)}` : `${rem(22)} ${rem(26)} ${rem(30)}`,
+            width: "100%",
+            boxSizing: "border-box",
+          }}
+        >
+          <h2 style={{ margin: `0 0 ${rem(6)}`, fontSize: TEXT.h2, fontWeight: 800, letterSpacing: rem(-0.5) }}>
+            {title}
+          </h2>
+          <div style={{ height: rem(8) }} />
+          {tab === "appearance" && <SettingsAppearance />}
+          {tab === "shortcuts" && <SettingsShortcuts />}
+          {tab === "general" && <SettingsGeneral />}
+          {tab === "vaults" && <SettingsVaults />}
+          {tab === "cloud" && <SettingsCloud />}
+          {tab === "security" && <SettingsSecurity />}
+          {tab === "about" && <SettingsAbout />}
+          {tab === "support" && <SettingsSupport />}
+        </div>
+      </div>
+    </div>
+  );
+}

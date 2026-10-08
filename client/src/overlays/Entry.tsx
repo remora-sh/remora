@@ -1,0 +1,1470 @@
+// Entry flow overlays — onboarding (create_account), Emergency Kit (one-time
+// Secret Key reveal), and unlock. All wired to the real core.
+
+import React, { useEffect, useReducer, useRef, useState } from "react";
+import { writeSecretToClipboard } from "@/bridge/clipboard";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { usePalette } from "@/theme/ThemeProvider";
+import { MONO, rem, rgba, TEXT, UI } from "@/theme/tokens";
+import { Btn, Checkbox, Field, Icon, Input, Logo, NO_AUTOCORRECT, Spinner, Toggle } from "@/components/primitives";
+import { useApp } from "@/store/app";
+import { recoverInstance } from "@/store/recovery";
+import { biometricUnlockReducer, initialBiometricUnlock } from "@/store/biometricUnlock";
+import { biometricMethod, isDesktopOs, isWindows, presenceGateApplies } from "@/bridge/platform";
+import { WindowControls } from "@/shell/Shell";
+import { useWindowControls } from "@/shell/WindowChrome";
+import { useIsMobile, useNarrow } from "@/store/responsive";
+import { toast } from "@/store/toast";
+import { guard } from "@/store/action";
+import * as api from "@/bridge/api";
+import { readSecretKeyOnce, rememberSecretKey } from "@/bridge/secretKey";
+import { logWarn } from "@/bridge/log";
+import { apiErrorMessage, type PairingPayload } from "@/bridge/types";
+import { useTranslation, Trans } from "@/i18n";
+import { exportPath } from "@/support/paths";
+
+function Modal({ children, w = 460 }: { children: React.ReactNode; w?: number }) {
+  const p = usePalette();
+  const isMobile = useIsMobile();
+  const narrow = useNarrow();
+  const customChrome = useApp((s) => s.customChrome);
+  const controls = useWindowControls();
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 100,
+        display: "flex",
+        flexDirection: narrow ? "column" : "row",
+        // Center the card. On phones the card's `margin: auto` does the vertical
+        // centering (not `justifyContent`), so when content + the software
+        // keyboard exceed the viewport a focused input can still scroll above the
+        // keyboard: auto margins center within spare space and collapse to 0 on
+        // overflow, leaving the top reachable (a center-anchored flex item taller
+        // than the viewport would push its top out of the scrollable area).
+        alignItems: "center",
+        justifyContent: isMobile ? "flex-start" : "center",
+        overflow: isMobile ? "auto" : "hidden",
+        background: p.bg0,
+        ...(isMobile
+          ? {
+              padding: "calc(env(safe-area-inset-top) + 20px) 16px calc(env(safe-area-inset-bottom) + 16px)",
+            }
+          : // Keep the centered card out of the top 44px chrome band: at the
+            // minimum window size the card would otherwise slide under the drag
+            // strip and the floating window controls.
+            { padding: `${rem(44)} 0 ${rem(16)}` }),
+      }}
+    >
+      <div
+        style={{
+          position: isMobile ? "fixed" : "absolute",
+          inset: 0,
+          background: p.name === "dark" ? "rgba(6,7,11,0.6)" : "rgba(255,255,255,0.5)",
+        }}
+      />
+      {/* This overlay covers the frameless window's own title bar, so it must
+          carry a drag strip and (non-mac) window controls of its own — without
+          them a locked window could be neither moved nor closed. Gated on the
+          BINARY's platform, not the device flag: the phone-shell preview on a
+          desktop OS still is a frameless window.
+          `customChrome` matters MORE here than on the main shell: this overlay is
+          what a user sees at launch, so it is where an imposed title bar is met
+          first and where leaving it behind would make the setting look broken.
+          With a real frame there is nothing to substitute for — the window
+          manager is already drawing the thing this strip exists to replace. */}
+      {isDesktopOs() && customChrome && (
+        <>
+          <div
+            data-tauri-drag-region
+            style={{ position: "absolute", top: 0, left: 0, right: 0, height: rem(44) }}
+          />
+          {/* Pinned to whichever corner the setting names — the same corner the
+              real title bar underneath this overlay uses, so the buttons do not
+              jump across the window when the vault unlocks. macOS renders
+              nothing here (its traffic lights are already on top of everything)
+              and so does the system-frame case. */}
+          <div
+            style={{
+              position: "absolute",
+              top: rem(7),
+              ...(controls.kind === "custom" && controls.side === "right"
+                ? { right: rem(16) }
+                : { left: rem(16) }),
+              zIndex: 1,
+            }}
+          >
+            <WindowControls />
+          </div>
+        </>
+      )}
+      <div
+        className="uh-view"
+        style={{
+          position: "relative",
+          // `margin: auto` + `flexShrink: 0` (mobile) centers the card vertically
+          // when it fits, yet keeps its natural height so the outer container
+          // scrolls (top reachable above the keyboard) when it doesn't.
+          margin: isMobile ? "auto" : undefined,
+          flexShrink: isMobile ? 0 : undefined,
+          // Design pixels: the card is sized to hold its own copy, so it grows
+          // with it. The vw/% caps stay viewport-relative — they are the "stay on
+          // screen and scroll" half, and `overflow: auto` below is the other.
+          width: isMobile ? "100%" : rem(w),
+          maxWidth: isMobile ? "100%" : "92vw",
+          maxHeight: isMobile ? "none" : "92%",
+          overflow: "auto",
+          background: p.bg1,
+          border: `1px solid ${p.line2}`,
+          borderRadius: 16,
+          padding: isMobile ? rem(20) : rem(30),
+          boxShadow: p.shadow,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Stepper({ step, isMobile }: { step: number; isMobile?: boolean }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const steps = [
+    t("onboarding.step.instance"),
+    t("onboarding.step.masterPassword"),
+    t("onboarding.step.emergencyKit"),
+  ];
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        // wrap on desktop too: 3 long RU step labels exhaust the ~400px card and hyphen-break
+        flexWrap: "wrap",
+        gap: isMobile ? `${rem(8)} ${rem(6)}` : rem(10),
+        marginBottom: rem(26),
+      }}
+    >
+      {steps.map((s, i) => (
+        <React.Fragment key={s}>
+          <div style={{ display: "flex", alignItems: "center", gap: isMobile ? rem(6) : rem(8) }}>
+            <span
+              style={{
+                width: rem(24),
+                height: rem(24),
+                flexShrink: 0,
+                borderRadius: "50%",
+                fontSize: TEXT.small,
+                fontWeight: 700,
+                fontFamily: MONO,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: i === step ? p.bg4 : p.bg3,
+                color: i < step ? p.txt2 : i === step ? p.txt : p.txt3,
+                border: `1px solid ${i === step ? p.line2 : p.line}`,
+              }}
+            >
+              {i < step ? "✓" : i + 1}
+            </span>
+            <span
+              style={{
+                fontSize: isMobile ? TEXT.small : TEXT.base,
+                fontWeight: i === step ? 700 : 500,
+                color: i === step ? p.txt : p.txt2,
+              }}
+            >
+              {s}
+            </span>
+          </div>
+          {i < steps.length - 1 && (
+            <span style={{ width: isMobile ? rem(12) : rem(22), height: 1, flexShrink: 0, background: p.line2 }} />
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+// Shared box metrics for the entry-overlay fields (taller + rounder than the modal
+// default). Only the height varies with the viewport, passed per call site.
+// <Input> props, not a style object: `gap` and `height` are DESIGN pixels that the
+// primitive converts, `pad` is raw CSS and converts here.
+const ENTRY_BOX = { radius: 11, pad: `0 ${rem(14)}`, gap: 10, fontSize: TEXT.body } as const;
+
+/** Coarse 0–4 master-password strength: length plus character-class variety.
+ *  Drives the meter only — the hard gate is non-empty + matching confirmation. */
+function pwStrength(pw: string): number {
+  if (!pw) return 0;
+  let s = 0;
+  if (pw.length >= 8) s++;
+  if (pw.length >= 12) s++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) s++;
+  if (/\d/.test(pw)) s++;
+  if (/[^A-Za-z0-9]/.test(pw)) s++;
+  return Math.min(4, s);
+}
+
+function Onboarding({ onCreated }: { onCreated: (secretKey: string) => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [usePwd, setUsePwd] = useState(true);
+  const [password, setPassword] = useState("");
+  const [confirmPwd, setConfirmPwd] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const strength = usePwd ? pwStrength(password) : 0;
+  const mismatch = usePwd && confirmPwd.length > 0 && confirmPwd !== password;
+  // Gate: with a master password on, require a non-empty value confirmed identically.
+  const canCreate = !busy && (!usePwd || (password.length > 0 && confirmPwd === password));
+
+  const create = async () => {
+    if (!canCreate) return;
+    setBusy(true);
+    try {
+      const sk = await api.createAccount(usePwd ? password : null);
+      useApp.setState({ requiresPassword: usePwd });
+      onCreated(sk);
+    } catch (e) {
+      logWarn(`account creation failed: ${apiErrorMessage(e)}`);
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  const onPwKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void create();
+    }
+  };
+
+  return (
+    <Modal>
+      <div style={{ marginBottom: rem(20) }}>
+        <Logo size={24} />
+      </div>
+      <Stepper step={0} isMobile={isMobile} />
+      <h1 style={{ margin: `0 0 ${rem(6)}`, fontSize: TEXT.h2, fontWeight: 800, letterSpacing: rem(-0.5) }}>
+        {t("onboarding.newInstanceTitle")}
+      </h1>
+      <p style={{ margin: `0 0 ${rem(20)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+        {t("onboarding.newInstanceDesc")}
+      </p>
+      <div style={{ display: "flex", flexDirection: "column", gap: rem(15) }}>
+        <div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: rem(7),
+            }}
+          >
+            <span style={{ fontSize: TEXT.small, fontWeight: 600, color: p.txt2 }}>
+              {t("onboarding.masterPassword")}{" "}
+              <span style={{ color: p.txt3, fontWeight: 500 }}>· {t("onboarding.optional")}</span>
+            </span>
+            <Toggle
+              checked={usePwd}
+              onChange={setUsePwd}
+              aria-label={t("onboarding.masterPassword")}
+            />
+          </div>
+          {usePwd ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: rem(8) }}>
+              <Field>
+                <Input
+                  icon="lock"
+                  accent
+                  {...ENTRY_BOX}
+                  height={isMobile ? 50 : 46}
+                  type="password"
+                  autoFocus
+                  value={password}
+                  onChange={setPassword}
+                  onKeyDown={onPwKeyDown}
+                  placeholder={t("onboarding.masterPasswordPlaceholder")}
+                />
+              </Field>
+              {password.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: rem(8) }}>
+                  <div style={{ flex: 1, display: "flex", gap: rem(4) }}>
+                    {[0, 1, 2, 3].map((i) => (
+                      <div
+                        key={i}
+                        style={{
+                          flex: 1,
+                          height: rem(4),
+                          borderRadius: 2,
+                          background:
+                            i < strength
+                              ? strength <= 1
+                                ? p.red
+                                : strength === 2
+                                  ? p.amber
+                                  : p.green
+                              : p.bg4,
+                          transition: "background .15s",
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <span style={{ fontSize: TEXT.micro, color: p.txt3, minWidth: rem(44), textAlign: "right" }}>
+                    {t(
+                      `onboarding.pwStrength.${strength <= 1 ? "weak" : strength === 2 ? "fair" : strength === 3 ? "good" : "strong"}`,
+                    )}
+                  </span>
+                </div>
+              )}
+              <Field>
+                <Input
+                  icon="lock"
+                  accent={!mismatch}
+                  {...ENTRY_BOX}
+                  height={isMobile ? 50 : 46}
+                  type="password"
+                  value={confirmPwd}
+                  onChange={setConfirmPwd}
+                  onKeyDown={onPwKeyDown}
+                  placeholder={t("onboarding.confirmPasswordPlaceholder")}
+                />
+              </Field>
+              {mismatch && (
+                <div style={{ fontSize: TEXT.small, color: p.red, padding: `0 ${rem(2)}` }}>
+                  {t("onboarding.passwordMismatch")}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: TEXT.base, color: p.txt2, padding: `${rem(6)} ${rem(2)}` }}>
+              {t("onboarding.noPasswordHint")}
+            </div>
+          )}
+        </div>
+      </div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: rem(9),
+          margin: `${rem(20)} 0`,
+          padding: `${rem(14)} 0`,
+          borderTop: `1px solid ${p.line}`,
+          borderBottom: `1px solid ${p.line}`,
+        }}
+      >
+        <Icon name="shieldcheck" size={17} color={p.txt3} style={{ marginTop: rem(1) }} />
+        <span style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+          <Trans
+            i18nKey="onboarding.secretKeyNotice"
+            components={{
+              b: <b style={{ color: p.txt }} />,
+              once: <b style={{ color: p.txt }} />,
+            }}
+          />
+        </span>
+      </div>
+      <Btn
+        size="lg"
+        icon={busy ? undefined : "key"}
+        full
+        onClick={create}
+        disabled={!canCreate}
+        style={isMobile ? { minHeight: rem(48) } : undefined}
+      >
+        {busy ? <Spinner size={16} color={p.accentInk} /> : t("onboarding.generateSecretKey")}
+      </Btn>
+      <Btn full variant="ghost" disabled={busy} style={{ marginTop: rem(10) }}
+        onClick={() => useApp.getState().setOverlay("recover")}>
+        {t("serverCloud.branchIdentity")} · {t("serverCloud.identityCta")}
+      </Btn>
+      <button
+        onClick={() => useApp.getState().setOverlay("join")}
+        disabled={busy}
+        style={{
+          display: "block",
+          width: "100%",
+          marginTop: rem(14),
+          padding: 0,
+          background: "none",
+          border: "none",
+          cursor: busy ? "default" : "pointer",
+          fontFamily: UI,
+          fontSize: TEXT.base,
+          color: p.txt3,
+          textAlign: "center",
+        }}
+      >
+        {t("onboarding.haveAccount")}{" "}
+        <span style={{ color: p.accentText, fontWeight: 600 }}>{t("onboarding.connectDevice")}</span>
+      </button>
+    </Modal>
+  );
+}
+
+function RecoverIdentity() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [baseUrl, setBaseUrl] = useState("");
+  const [handle, setHandle] = useState("");
+  const [password, setPassword] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const recover = async () => {
+    if (busy || !baseUrl.trim() || !handle.trim() || !secretKey.trim()) return;
+    setBusy(true);
+    try {
+      await recoverInstance(baseUrl, handle, password, secretKey);
+      setPassword("");
+      setSecretKey("");
+    } catch (e) {
+      toast(apiErrorMessage(e), "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal>
+      <h1 style={{ margin: `0 0 ${rem(10)}`, fontSize: TEXT.h2 }}>{t("serverCloud.branchIdentity")}</h1>
+      <p style={{ color: p.txt2, fontSize: TEXT.base, lineHeight: 1.5 }}>{t("serverCloud.identityHint")}</p>
+      <form onSubmit={(e) => { e.preventDefault(); void recover(); }}
+        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void recover(); } }}>
+        <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0,
+          display: "flex", flexDirection: "column", gap: rem(14) }}>
+        <Field label={t("serverCloud.baseUrl")}>
+          <Input {...ENTRY_BOX} value={baseUrl} onChange={setBaseUrl} autoFocus
+            placeholder={t("serverCloud.baseUrlPlaceholder")} />
+        </Field>
+        <Field label={t("serverCloud.handle")}>
+          <Input {...ENTRY_BOX} value={handle} onChange={setHandle}
+            placeholder={t("serverCloud.handlePlaceholder")} />
+        </Field>
+        <Field label={t("serverCloud.identityPassword")}>
+          <Input {...ENTRY_BOX} type="password" value={password} onChange={setPassword}
+            placeholder={t("serverCloud.identityPasswordPlaceholder")} />
+        </Field>
+        <Field label={t("serverCloud.identitySecretKey")}>
+          <Input {...ENTRY_BOX} type="password" mono value={secretKey} onChange={setSecretKey}
+            placeholder={t("serverCloud.identitySecretKeyPlaceholder")} />
+        </Field>
+        <Btn onClick={() => void recover()} full disabled={busy || !baseUrl.trim() || !handle.trim() || !secretKey.trim()}>
+          {busy ? <Spinner size={16} color={p.accentInk} /> : t("serverCloud.identityCta")}
+        </Btn>
+        {/* Recovery can install the local identity before enrollment/login fails.
+            Re-read status on Back instead of offering create_account over its DB. */}
+        <Btn full variant="ghost" onClick={() => void useApp.getState().boot()}>
+          {t("common.back")}
+        </Btn>
+        </fieldset>
+      </form>
+    </Modal>
+  );
+}
+
+function formatSecretKey(hex: string): string[] {
+  // group into readable chunks of 5
+  const up = hex.toUpperCase();
+  const out: string[] = [];
+  for (let i = 0; i < up.length; i += 5) out.push(up.slice(i, i + 5));
+  return out;
+}
+
+function EmergencyKit({ secretKey, onDone }: { secretKey: string | null; onDone: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [saved, setSaved] = useState(false);
+  // Reveal mode: opened from Settings → Recovery without a freshly-created key.
+  // Re-read the Secret Key from this device's OS keychain so the user can retrieve
+  // and re-save it (the "pull the keychain key again" path). Works only where a key
+  // is stored (a trusted, already-unlocked device); null elsewhere (e.g. Android).
+  const isReveal = !secretKey;
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const [loading, setLoading] = useState(isReveal);
+  useEffect(() => {
+    if (!isReveal) return;
+    let alive = true;
+    api
+      .keychainGetSecretKey()
+      .then((k) => alive && setRevealed(k))
+      .catch(() => {})
+      .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, [isReveal]);
+  const key = secretKey ?? revealed;
+  const segs = key ? formatSecretKey(key) : [];
+
+  const copy = async () => {
+    if (!key) return;
+    try {
+      await writeSecretToClipboard(key);
+      toast(t("onboarding.toast.secretKeyCopied"), "ok");
+    } catch {
+      toast(t("onboarding.toast.copyFailed"), "err");
+    }
+  };
+  const download = async () => {
+    if (!key) return;
+    const body = t("onboarding.kitFileBody", { secretKey: key });
+    await guard(async () => {
+      const path = await save({
+        defaultPath: await exportPath("unissh-emergency-kit.txt"),
+        filters: [{ name: "Text", extensions: ["txt"] }],
+      });
+      if (path) {
+        await writeTextFile(path, body);
+        toast(t("onboarding.toast.kitSaved"), "ok");
+      }
+    });
+  };
+
+  return (
+    <Modal w={540}>
+      {!isReveal && <Stepper step={2} isMobile={isMobile} />}
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: rem(6) }}>
+        <span
+          style={{
+            width: rem(38),
+            height: rem(38),
+            flexShrink: 0,
+            borderRadius: 12,
+            background: rgba(p.amber, 0.12),
+            border: `1px solid ${rgba(p.amber, 0.5)}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="key" size={20} color={p.amber} />
+        </span>
+        <h1
+          style={{ margin: 0, fontSize: TEXT.h2, fontWeight: 800, letterSpacing: rem(-0.5), whiteSpace: "nowrap" }}
+        >
+          {t("onboarding.yourSecretKey")}
+        </h1>
+      </div>
+      {loading ? (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: `${rem(40)} 0` }}>
+          <Spinner size={22} />
+        </div>
+      ) : key ? (
+        <>
+          <p style={{ margin: `0 0 ${rem(18)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+            {isReveal ? t("onboarding.revealNotice") : t("onboarding.singleShowNotice")}
+          </p>
+          <div
+            style={{
+              position: "relative",
+              padding: `${rem(16)} ${rem(18)} ${rem(18)}`,
+              borderRadius: 16,
+              background: p.bg0,
+              border: `1px solid ${p.line2}`,
+              marginBottom: rem(14),
+            }}
+          >
+            <div
+              style={{
+                fontFamily: MONO,
+                fontSize: TEXT.micro,
+                color: p.txt2,
+                letterSpacing: rem(1),
+                marginBottom: rem(12),
+              }}
+            >
+              {t("onboarding.secretKeyLabel")}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: `${rem(11)} ${rem(9)}`, alignItems: "center" }}>
+              {segs.map((s, i) => (
+                <React.Fragment key={i}>
+                  <span
+                    style={{ fontFamily: MONO, fontSize: rem(18), fontWeight: 700, color: p.txt, letterSpacing: rem(2) }}
+                  >
+                    {s}
+                  </span>
+                  {i < segs.length - 1 && <span style={{ color: p.txt3, fontWeight: 700 }}>-</span>}
+                </React.Fragment>
+              ))}
+            </div>
+          </div>
+          <div
+            style={{
+              display: "flex",
+              // wrap on desktop too: long RU labels (Скачать .txt / Скопировать) overlap below ~587px
+              flexWrap: "wrap",
+              gap: rem(10),
+              marginBottom: rem(16),
+            }}
+          >
+            <Btn
+              variant="ghost"
+              icon="copy"
+              style={{ flex: isMobile ? "1 1 100%" : 1, minHeight: isMobile ? rem(44) : undefined }}
+              onClick={copy}
+            >
+              {t("common.copy")}
+            </Btn>
+            <Btn
+              variant="ghost"
+              icon="download"
+              style={{ flex: isMobile ? "1 1 100%" : 1, minHeight: isMobile ? rem(44) : undefined }}
+              onClick={download}
+            >
+              {t("onboarding.downloadTxt")}
+            </Btn>
+            <Btn
+              variant="ghost"
+              icon="hash"
+              style={{ flex: isMobile ? "1 1 100%" : 1, minHeight: isMobile ? rem(44) : undefined }}
+              onClick={() => window.print()}
+            >
+              {t("onboarding.print")}
+            </Btn>
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: rem(9),
+              marginBottom: rem(16),
+              padding: rem(12),
+              borderRadius: 12,
+              background: rgba(p.amber, 0.1),
+              border: `1px solid ${rgba(p.amber, 0.4)}`,
+            }}
+          >
+            <Icon name="shield" size={17} color={p.amber} style={{ marginTop: rem(1) }} />
+            <span style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+              <Trans
+                i18nKey="onboarding.lossWarning"
+                components={{ b: <b style={{ color: p.txt }} /> }}
+              />
+            </span>
+          </div>
+          {isReveal ? (
+            <Btn
+              size="lg"
+              full
+              onClick={onDone}
+              style={isMobile ? { minHeight: rem(48) } : undefined}
+            >
+              {t("common.done")}
+            </Btn>
+          ) : (
+            <>
+              <Checkbox
+                checked={saved}
+                onChange={setSaved}
+                size={22}
+                label={t("onboarding.kitSaved")}
+                style={{ display: "flex", gap: rem(11), marginBottom: rem(16) }}
+                labelStyle={{ fontSize: TEXT.base, color: p.txt, fontWeight: 600 }}
+              />
+          {/* really disabled (not opacity-faked): unfocusable and announced as
+              disabled until the "I saved it" checkbox is ticked */}
+          <Btn
+            size="lg"
+            icon="ar"
+            full
+            variant={saved ? "primary" : "ghost"}
+            disabled={!saved}
+            style={{
+              ...(saved ? {} : { opacity: 0.5, cursor: "not-allowed" }),
+              ...(isMobile ? { minHeight: rem(48) } : null),
+            }}
+            onClick={() => saved && onDone()}
+          >
+            {t("onboarding.goToInstance")}
+          </Btn>
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <p style={{ margin: `0 0 ${rem(18)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+            <Trans
+              i18nKey="onboarding.alreadyShownNotice"
+              components={{ b: <b style={{ color: p.txt }} /> }}
+            />
+          </p>
+          <Btn size="lg" full onClick={onDone} style={isMobile ? { minHeight: rem(48) } : undefined}>
+            {t("onboarding.gotIt")}
+          </Btn>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function Unlock() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [password, setPassword] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+  const [fromKeychain, setFromKeychain] = useState(false);
+  const [busy, setBusy] = useState(false);
+  // Hide the master-password field for a passwordless (Secret-Key-only) instance —
+  // there's nothing to type. `requiresPassword` is derived from the on-disk keyset
+  // header at boot, so it's known before unlocking. null/true → keep the field.
+  const requiresPassword = useApp((s) => s.requiresPassword);
+  const lockReason = useApp((s) => s.lockReason);
+  // The Secret-Key-only presence gate: the remembered Secret Key is used only
+  // after Touch ID / Windows Hello, so it is not put in the field either —
+  // otherwise dismissing the prompt would leave a one-click unlock behind it.
+  const presenceGate = useApp((s) => s.presenceGate);
+  const gateMode = presenceGateApplies(requiresPassword, presenceGate);
+  // Biometric path (Touch ID / Windows Hello): see store/biometricUnlock.ts for the transitions.
+  // The password and the Secret Key never come back to JS on this path — Rust
+  // reads, unseals and unlocks.
+  const [bio, dispatchBio] = useReducer(biometricUnlockReducer, initialBiometricUnlock);
+  // One prompt per entry into "prompting", even under StrictMode's double effects.
+  const prompted = useRef(false);
+  // Locked by the OS (screen lock, sleep): the window can still report focus
+  // under the lock screen, so the first prompt waits for a sign the user is
+  // back at it rather than appearing where nobody can answer it.
+  const waitForReturn = useRef(lockReason === "screen-lock" || lockReason === "suspend");
+  // A prompt skipped from the view may still unlock later, beside a manual
+  // unlock: the steps after unlocking run once.
+  const finished = useRef(false);
+
+  // prefill the Secret Key from the OS keychain if it was saved on this device
+  // (cached read — at most one keychain access per process)
+  useEffect(() => {
+    if (gateMode) return;
+    readSecretKeyOnce()
+      .then((k) => {
+        if (k) {
+          setSecretKey(k);
+          setFromKeychain(true);
+        }
+      })
+      .catch(() => {});
+  }, [gateMode]);
+
+  // Is biometric unlock enabled here? Only a password vault has anything stored
+  // behind it; anywhere without an adapter the answer is simply "no".
+  useEffect(() => {
+    const none = { type: "status", enabled: false, secretKeyRemembered: false } as const;
+    if (gateMode) {
+      api
+        .biometricStatus(true)
+        .then((s) =>
+          dispatchBio({
+            type: "gate",
+            on: true,
+            secretKeyRemembered: s.secretKeyRemembered,
+            presenceSupported: s.presenceSupported,
+          }),
+        )
+        .catch(() => dispatchBio({ type: "gate", on: false, secretKeyRemembered: false, presenceSupported: false }));
+      return;
+    }
+    if (requiresPassword === false) {
+      dispatchBio(none);
+      return;
+    }
+    // Without stored material Rust does not touch the keychain for this, so a
+    // device without biometric unlock shows the password field at once.
+    api
+      .biometricStatus(false)
+      .then((s) => dispatchBio({ type: "status", enabled: s.enabled, secretKeyRemembered: s.secretKeyRemembered }))
+      .catch(() => dispatchBio(none));
+  }, [requiresPassword, gateMode]);
+
+  // Prompt as soon as the screen enters "prompting" — but not while the window
+  // is in the background: then on the first focus, so the sheet meets the
+  // user. After an OS lock, not before a sign of the user (focus, the pointer
+  // or a key reaching the window, the window becoming visible): under the lock
+  // screen the window may still claim focus. A retry is the user, so it is
+  // immediate.
+  useEffect(() => {
+    if (bio.phase !== "prompting") {
+      prompted.current = false;
+      return;
+    }
+    if (prompted.current) return;
+    const go = () => {
+      if (prompted.current) return;
+      prompted.current = true;
+      waitForReturn.current = false;
+      // The presence gate's Windows prompt shows the reason on its own, as a
+      // sentence; Touch ID puts it after "Remora is trying to".
+      const prompt = bio.gate
+        ? api.biometricPresenceUnlock(
+            t(isWindows() ? "onboarding.presenceReasonWindows" : "onboarding.biometricReason"),
+          )
+        : api.biometricUnlock(t("onboarding.biometricReason"));
+      prompt
+        .then((outcome) => {
+          dispatchBio({ type: "outcome", outcome });
+          if (outcome === "unlocked") {
+            afterUnlock().catch((e) => {
+              logWarn(`post-unlock steps failed: ${apiErrorMessage(e)}`);
+              toast(apiErrorMessage(e), "err");
+            });
+          }
+        })
+        .catch((e) => {
+          logWarn(`biometric unlock failed: ${apiErrorMessage(e)}`);
+          dispatchBio({ type: "error" });
+        });
+    };
+    const osLock = waitForReturn.current;
+    if (document.hasFocus() && !osLock) {
+      go();
+      return;
+    }
+    const signs = osLock ? (["focus", "pointermove", "pointerdown", "keydown"] as const) : (["focus"] as const);
+    function detach() {
+      for (const name of signs) window.removeEventListener(name, onSign);
+      document.removeEventListener("visibilitychange", onSign);
+    }
+    function onSign() {
+      if (document.visibilityState !== "visible") return;
+      detach();
+      go();
+    }
+    for (const name of signs) window.addEventListener(name, onSign);
+    if (osLock) document.addEventListener("visibilitychange", onSign);
+    return detach;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one prompt per phase entry
+  }, [bio.phase]);
+
+  // Everything after the core said yes, whichever way it was asked.
+  const afterUnlock = async () => {
+    if (finished.current) return;
+    finished.current = true;
+    useApp.setState({ unlocked: true, overlay: null, lockReason: null });
+    await useApp.getState().reloadVaults();
+    await useApp.getState().reloadServerStatus();
+    // Bind legacy unbound cloud vaults now — the normal locked cold-start path
+    // doesn't run boot()'s unlocked branch, so this is where it actually fires.
+    await useApp.getState().maybeBindLegacyCloudVaults();
+    // Pull cloud vaults from any live server session (no-op without one).
+    useApp.getState().cloudAutoSync();
+    toast(t("onboarding.toast.unlocked"), "ok");
+  };
+
+  const unlock = async () => {
+    if (busy) return;
+    setBusy(true);
+    const cleanKey = secretKey.replace(/[\s-]/g, "");
+    try {
+      await api.unlock(password ? password : null, cleanKey);
+      // store the key only if it wasn't already in the keychain — avoids a
+      // write (and its prompt) on every unlock. Under the presence gate the
+      // field is never prefilled, yet the key is already remembered (that is
+      // what the gate guards): no rewrite there either — unless the remembered
+      // one is gone or no longer opens this vault.
+      const remembered = bio.gate && bio.notice !== "noSecretKey";
+      if (!fromKeychain && !remembered) rememberSecretKey(cleanKey);
+      await afterUnlock();
+    } catch (e) {
+      logWarn(`unlock failed: ${apiErrorMessage(e)}`);
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  // Escape hatch for a returning user who genuinely can't unlock (lost the master
+  // password / Secret Key): wipe this device's instance and start over. Confirm-
+  // gated and destructive — the backend refuses while unlocked.
+  const resetDevice = () => {
+    useApp.getState().setConfirm({
+      title: t("entry.unlock.resetTitle"),
+      body: t("entry.unlock.resetBody"),
+      danger: true,
+      icon: "trash",
+      confirmLabel: t("entry.unlock.resetConfirm"),
+      onConfirm: async () => {
+        await guard(async () => {
+          await api.resetInstance();
+          await useApp.getState().boot(); // both files gone → lands on onboarding
+          toast(t("entry.unlock.resetDone"), "ok");
+        });
+      },
+    });
+  };
+
+  return (
+    <Modal w={400}>
+      <div style={{ textAlign: "center" }}>
+        <div
+          style={{
+            width: rem(60),
+            height: rem(60),
+            margin: "0 auto 18px",
+            borderRadius: 16,
+            background: p.bg3,
+            border: `1px solid ${p.line2}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="lock" size={26} color={p.txt2} stroke={2} />
+        </div>
+        <h1 style={{ margin: `0 0 ${rem(4)}`, fontSize: TEXT.h3, fontWeight: 800, letterSpacing: rem(-0.4) }}>
+          {t("onboarding.locked")}
+        </h1>
+        <p style={{ margin: `0 0 ${rem(22)}`, fontSize: TEXT.base, color: p.txt2 }}>
+          {/* Say why, when there is a why worth saying. A vault that closed
+              because the user locked the screen or shut the lid is otherwise
+              indistinguishable from one that timed out, and the sessions are
+              gone either way — "what happened to my terminals" deserves an
+              answer on the screen that took them. */}
+          {lockReason === "screen-lock"
+            ? t("onboarding.lockedByScreen")
+            : lockReason === "suspend"
+              ? t("onboarding.lockedBySleep")
+              : t("onboarding.secretsZeroed")}
+        </p>
+      </div>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (bio.phase === "password") void unlock();
+        }}
+        style={{ display: "flex", flexDirection: "column", gap: rem(13) }}
+      >
+        {bio.phase === "prompting" && (
+          <div
+            role="status"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: rem(8),
+              padding: `${rem(10)} 0`,
+              fontSize: TEXT.base,
+              color: p.txt2,
+            }}
+          >
+            <Spinner size={14} color={p.txt2} />
+            {t("onboarding.biometricWaiting", { method: biometricMethod() })}
+          </div>
+        )}
+        {bio.phase === "prompting" && (
+          // The way out of a prompt that never answers (a dialog behind the
+          // window, a hung check): the manual unlock, at once.
+          <Btn type="button" variant="ghost" full onClick={() => dispatchBio({ type: "skip" })}>
+            {t(bio.gate ? "onboarding.presenceSkip" : "onboarding.biometricSkip")}
+          </Btn>
+        )}
+        {bio.notice && (
+          <div role="status" style={{ fontSize: TEXT.small, color: p.txt2, lineHeight: 1.45 }}>
+            {t(
+              bio.notice === "invalidated"
+                ? isWindows()
+                  ? "onboarding.biometricInvalidatedWindows"
+                  : "onboarding.biometricInvalidated"
+                : bio.notice === "noSecretKey"
+                  ? bio.gate
+                    ? "onboarding.presenceNoSecretKey"
+                    : "onboarding.biometricNoSecretKey"
+                  : bio.notice === "gateUnavailable"
+                    ? "onboarding.presenceUnavailable"
+                  : bio.notice === "gated"
+                    ? "onboarding.presenceGated"
+                    : bio.gate
+                      ? "onboarding.presenceFailed"
+                      : "onboarding.biometricFailed",
+              { method: biometricMethod() },
+            )}
+          </div>
+        )}
+        {/* Hidden while the biometric status is pending as well, so an enabled
+            Touch ID does not flash the password field before the prompt. */}
+        {requiresPassword !== false && bio.phase !== "prompting" && bio.phase !== "checking" && (
+          <Field label={t("onboarding.masterPassword")} labelGap={7}>
+            <Input
+              icon="lock"
+              accent
+              {...ENTRY_BOX}
+              height={isMobile ? 50 : 46}
+              type="password"
+              value={password}
+              onChange={setPassword}
+              placeholder={t("onboarding.ifSetPlaceholder")}
+            />
+          </Field>
+        )}
+        <Field label={t("onboarding.secretKeyFromKit")} labelGap={7}>
+          <Input
+            icon="key"
+            mono
+            {...ENTRY_BOX}
+            height={isMobile ? 50 : 46}
+            type="password"
+            value={secretKey}
+            autoFocus={!fromKeychain}
+            onChange={(v) => {
+              setSecretKey(v);
+              setFromKeychain(false);
+            }}
+            placeholder="A3-7KQX2-…"
+          />
+        </Field>
+        {fromKeychain && (
+          <div
+            style={{ display: "flex", alignItems: "center", gap: rem(6), fontSize: TEXT.small, color: p.green }}
+          >
+            <Icon name="shieldcheck" size={12} color={p.green} />
+            {t("onboarding.loadedFromKeychain")}
+          </div>
+        )}
+        <div style={{ margin: `${rem(5)} 0` }}>
+          <Btn
+            size="lg"
+            icon={busy ? undefined : "unlock"}
+            full
+            onClick={unlock}
+            disabled={busy || bio.phase === "prompting" || bio.phase === "checking"}
+            style={isMobile ? { minHeight: rem(48) } : undefined}
+          >
+            {busy ? <Spinner size={16} color={p.accentInk} /> : t("onboarding.unlock")}
+          </Btn>
+        </div>
+        {bio.phase === "password" && bio.available && (
+          <Btn type="button" variant="ghost" icon="fingerprint" full onClick={() => dispatchBio({ type: "retry" })} disabled={busy}>
+            {t("onboarding.biometricRetry", { method: biometricMethod() })}
+          </Btn>
+        )}
+      </form>
+      <button
+        onClick={() => useApp.getState().setOverlay("join")}
+        style={{
+          display: "block",
+          width: "100%",
+          margin: `${rem(2)} 0 ${rem(10)}`,
+          padding: 0,
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          fontFamily: UI,
+          fontSize: TEXT.base,
+          fontWeight: 600,
+          color: p.accentText,
+          textAlign: "center",
+        }}
+      >
+        {t("entry.unlock.connectDevice")}
+      </button>
+      <button
+        onClick={resetDevice}
+        style={{
+          display: "block",
+          width: "100%",
+          margin: `${rem(2)} 0 ${rem(14)}`,
+          padding: 0,
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          fontFamily: UI,
+          fontSize: TEXT.small,
+          color: p.txt3,
+          textAlign: "center",
+        }}
+      >
+        {t("entry.unlock.cantUnlock")}{" "}
+        <span style={{ color: p.red, fontWeight: 600 }}>{t("entry.unlock.reset")}</span>
+      </button>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: rem(6),
+          fontSize: TEXT.small,
+          color: p.txt3,
+        }}
+      >
+        <Icon name="refresh" size={12} color={p.txt3} />
+        {t("onboarding.autoLock")}
+      </div>
+    </Modal>
+  );
+}
+
+/** Shown when the instance is half-written on disk (exactly one of the DB /
+ *  keyset files present). Such an instance can neither be unlocked nor recreated,
+ *  so we explain the inconsistency and offer a safe, confirm-gated reset that
+ *  clears the stray file(s) and drops back to onboarding. */
+function Repair() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [busy, setBusy] = useState(false);
+  // Disable the button while the confirm is up so a backdrop-dismiss + re-click
+  // can't restack the dialog; clears itself when the confirm is cancelled.
+  const confirmShown = useApp((s) => s.confirm !== null);
+  // The confirm's onConfirm closure captures `busy` at definition time, so the
+  // state read there is stale across re-clicks — guard with a ref read/written
+  // synchronously instead. (The backend reset is idempotent + hard-guarded too.)
+  const busyRef = useRef(false);
+
+  const reset = () => {
+    useApp.getState().setConfirm({
+      title: t("entry.repair.resetTitle"),
+      body: t("entry.repair.resetBody"),
+      danger: true,
+      icon: "trash",
+      confirmLabel: t("entry.repair.resetConfirm"),
+      onConfirm: async () => {
+        if (busyRef.current) return;
+        busyRef.current = true;
+        setBusy(true);
+        try {
+          await api.resetPartialInstance();
+          // re-boot: with both files gone, boot() lands on onboarding.
+          await useApp.getState().boot();
+          toast(t("entry.repair.done"), "ok");
+        } catch (e) {
+          toast(apiErrorMessage(e), "err");
+          busyRef.current = false;
+          setBusy(false);
+        }
+      },
+    });
+  };
+
+  return (
+    <Modal w={460}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: rem(6) }}>
+        <span
+          style={{
+            width: rem(38),
+            height: rem(38),
+            flexShrink: 0,
+            borderRadius: 12,
+            background: rgba(p.amber, 0.12),
+            border: `1px solid ${rgba(p.amber, 0.5)}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="shield" size={20} color={p.amber} />
+        </span>
+        <h1 style={{ margin: 0, fontSize: TEXT.h3, fontWeight: 800, letterSpacing: rem(-0.4) }}>
+          {t("entry.repair.title")}
+        </h1>
+      </div>
+      <p style={{ margin: `0 0 ${rem(20)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.55 }}>
+        {t("entry.repair.body")}
+      </p>
+      <Btn
+        size="lg"
+        icon={busy ? undefined : "trash"}
+        variant="outline"
+        full
+        onClick={reset}
+        disabled={busy || confirmShown}
+        style={{ color: p.red, borderColor: rgba(p.red, 0.5), ...(isMobile ? { minHeight: rem(48) } : null) }}
+      >
+        {busy ? <Spinner size={16} color={p.red} /> : t("entry.repair.reset")}
+      </Btn>
+    </Modal>
+  );
+}
+
+/** Shown when `instance_status` itself failed (a transient backend error, not
+ *  "no instance"). Offers a retry so a returning user isn't pushed to onboarding. */
+function Retry() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [busy, setBusy] = useState(false);
+
+  const retry = async () => {
+    if (busy) return;
+    setBusy(true);
+    await useApp.getState().boot();
+    // boot() always resolves and re-routes the overlay; if it still fails we land
+    // back here, so clear busy for another attempt.
+    setBusy(false);
+  };
+
+  return (
+    <Modal w={400}>
+      <div style={{ textAlign: "center" }}>
+        <div
+          style={{
+            width: rem(60),
+            height: rem(60),
+            margin: "0 auto 18px",
+            borderRadius: 16,
+            background: p.bg3,
+            border: `1px solid ${p.line2}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="refresh" size={26} color={p.txt2} stroke={2} />
+        </div>
+        <h1 style={{ margin: `0 0 ${rem(4)}`, fontSize: TEXT.h3, fontWeight: 800, letterSpacing: rem(-0.4) }}>
+          {t("entry.retry.title")}
+        </h1>
+        <p style={{ margin: `0 0 ${rem(22)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+          {t("entry.retry.body")}
+        </p>
+      </div>
+      <Btn
+        size="lg"
+        icon={busy ? undefined : "refresh"}
+        full
+        onClick={retry}
+        disabled={busy}
+        style={isMobile ? { minHeight: rem(48) } : undefined}
+      >
+        {busy ? <Spinner size={16} color={p.accentInk} /> : t("entry.retry.retry")}
+      </Btn>
+    </Modal>
+  );
+}
+
+/** Parse the 6-line `key: value` pairing payload copied from an existing device's
+ *  "Add device" card back into a PairingPayload. Lenient: ignores order, blank
+ *  lines and stray whitespace, and splits each line on its FIRST colon so a
+ *  value's own `:` (e.g. an `https://` URL) is preserved. */
+function parsePairingPayload(text: string): PairingPayload | null {
+  const map: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const i = line.indexOf(":");
+    if (i < 0) continue;
+    const k = line.slice(0, i).trim();
+    const v = line.slice(i + 1).trim();
+    if (k && v) map[k] = v;
+  }
+  const { baseUrl, instanceId, spaceId, accountId, deviceId, channelId, oobCode } = map;
+  if (baseUrl && instanceId && spaceId && accountId && deviceId && channelId && oobCode) {
+    return { baseUrl, instanceId, spaceId, accountId, deviceId, channelId, oobCode };
+  }
+  return null;
+}
+
+/** New-device join (Path B): paste the pairing payload from an existing, unlocked
+ *  device, run the PAKE, and receive the account keyset + its shared Secret Key.
+ *  The backend installs the keyset and persists the shared key to the OS keychain
+ *  itself — the key never enters the webview, and there is no new Emergency Kit
+ *  (the user already holds the account's one). */
+function JoinDevice({ onBack }: { onBack: () => void }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const [code, setCode] = useState("");
+  const [usePwd, setUsePwd] = useState(true);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const join = async () => {
+    if (busy) return;
+    const payload = parsePairingPayload(code);
+    if (!payload) {
+      toast(t("entry.join.invalidCode"), "warn");
+      return;
+    }
+    setBusy(true);
+    try {
+      // Blocks until the other device's PAKE completes (it must be on its
+      // "Add device" screen). The shared Secret Key is persisted backend-side.
+      await api.serverOnboardJoin(payload, usePwd ? password : null);
+      useApp.setState({
+        instanceExists: true,
+        unlocked: true,
+        overlay: null,
+        requiresPassword: usePwd,
+      });
+      await useApp.getState().reloadVaults();
+      await useApp.getState().reloadServerStatus();
+      // The join established a cloud session — pull the account's cloud vaults so
+      // they appear on this new device without a manual "Sync now".
+      useApp.getState().cloudAutoSync();
+      toast(t("entry.join.done"), "ok");
+    } catch (e) {
+      logWarn(`device join failed: ${apiErrorMessage(e)}`);
+      toast(apiErrorMessage(e), "err");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal w={460}>
+      <div style={{ marginBottom: rem(18) }}>
+        <Logo size={24} />
+      </div>
+      <h1 style={{ margin: `0 0 ${rem(6)}`, fontSize: TEXT.h2, fontWeight: 800, letterSpacing: rem(-0.5) }}>
+        {t("entry.join.title")}
+      </h1>
+      <p style={{ margin: `0 0 ${rem(18)}`, fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+        {t("entry.join.desc")}
+      </p>
+      <textarea
+        {...NO_AUTOCORRECT}
+        value={code}
+        onChange={(e) => setCode(e.target.value)}
+        placeholder={t("entry.join.codePlaceholder")}
+        spellCheck={false}
+        disabled={busy}
+        style={{
+          width: "100%",
+          minHeight: rem(128),
+          resize: "vertical",
+          padding: rem(12),
+          borderRadius: 12,
+          background: p.bg2,
+          border: `1px solid ${p.line2}`,
+          outline: "none",
+          fontFamily: MONO,
+          fontSize: TEXT.small,
+          lineHeight: 1.5,
+          color: p.txt,
+          boxSizing: "border-box",
+        }}
+      />
+      <div style={{ marginTop: rem(15) }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: rem(7),
+          }}
+        >
+          <span style={{ fontSize: TEXT.small, fontWeight: 600, color: p.txt2 }}>
+            {t("onboarding.masterPassword")}{" "}
+            <span style={{ color: p.txt3, fontWeight: 500 }}>· {t("onboarding.optional")}</span>
+          </span>
+          <Toggle
+            checked={usePwd}
+            onChange={setUsePwd}
+            aria-label={t("onboarding.masterPassword")}
+          />
+        </div>
+        {usePwd ? (
+          <Field>
+            <Input
+              icon="lock"
+              accent
+              {...ENTRY_BOX}
+              height={isMobile ? 50 : 46}
+              type="password"
+              value={password}
+              onChange={setPassword}
+              placeholder={t("onboarding.masterPasswordPlaceholder")}
+            />
+          </Field>
+        ) : (
+          <div style={{ fontSize: TEXT.base, color: p.txt2, padding: `${rem(6)} ${rem(2)}` }}>
+            {t("onboarding.noPasswordHint")}
+          </div>
+        )}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: rem(9),
+          margin: `${rem(18)} 0`,
+          padding: `${rem(14)} 0`,
+          borderTop: `1px solid ${p.line}`,
+          borderBottom: `1px solid ${p.line}`,
+        }}
+      >
+        <Icon name="link" size={17} color={p.txt3} style={{ marginTop: rem(1) }} />
+        <span style={{ fontSize: TEXT.base, color: p.txt2, lineHeight: 1.5 }}>
+          {busy ? t("entry.join.waiting") : t("entry.join.hint")}
+        </span>
+      </div>
+      <Btn
+        size="lg"
+        icon={busy ? undefined : "link"}
+        full
+        onClick={join}
+        disabled={busy}
+        style={isMobile ? { minHeight: rem(48) } : undefined}
+      >
+        {busy ? <Spinner size={16} color={p.accentInk} /> : t("entry.join.connect")}
+      </Btn>
+      <button
+        onClick={onBack}
+        disabled={busy}
+        style={{
+          display: "block",
+          width: "100%",
+          marginTop: rem(14),
+          padding: 0,
+          background: "none",
+          border: "none",
+          cursor: busy ? "default" : "pointer",
+          fontFamily: UI,
+          fontSize: TEXT.base,
+          color: p.txt3,
+          textAlign: "center",
+        }}
+      >
+        {t("common.back")}
+      </button>
+    </Modal>
+  );
+}
+
+/** Renders whichever entry overlay is active, owning the one-time Secret Key. */
+export function EntryOverlays() {
+  const overlay = useApp((s) => s.overlay);
+  const setOverlay = useApp((s) => s.setOverlay);
+  const instanceExists = useApp((s) => s.instanceExists);
+  const [secretKey, setSecretKey] = useState<string | null>(null);
+
+  if (overlay === "onboarding") {
+    return (
+      <Onboarding
+        onCreated={(sk) => {
+          setSecretKey(sk);
+          // remember on this trusted device for quick unlock (single write)
+          rememberSecretKey(sk);
+          useApp.setState({ instanceExists: true, unlocked: true });
+          setOverlay("kit");
+        }}
+      />
+    );
+  }
+  if (overlay === "kit") {
+    return (
+      <EmergencyKit
+        secretKey={secretKey}
+        onDone={async () => {
+          setSecretKey(null);
+          setOverlay(null);
+          await useApp.getState().reloadVaults();
+        }}
+      />
+    );
+  }
+  if (overlay === "unlock") {
+    return <Unlock />;
+  }
+  if (overlay === "recover") {
+    return <RecoverIdentity />;
+  }
+  if (overlay === "join") {
+    return <JoinDevice onBack={() => setOverlay(instanceExists ? "unlock" : "onboarding")} />;
+  }
+  if (overlay === "repair") {
+    return <Repair />;
+  }
+  if (overlay === "retry") {
+    return <Retry />;
+  }
+  return null;
+}

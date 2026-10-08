@@ -1,0 +1,710 @@
+//! Config (figment: defaults → TOML → env). Hierarchy and keys — spec §14.2.
+//! Env-override: `UNISSH__SERVER__BIND=...` (double-underscore nesting).
+
+use figment::Figment;
+use figment::providers::{Env, Format, Serialized, Toml};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub db: DbConfig,
+    pub limits: LimitsConfig,
+    pub sync: SyncConfig,
+    pub session: SessionConfig,
+    pub obs: ObsConfig,
+    pub ops: OpsConfig,
+    pub setup: SetupConfig,
+    pub oidc: OidcConfig,
+    pub audit: AuditConfig,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub bind: String,
+    /// PEM certificate for in-process rustls (TLS 1.3). Empty → no TLS inside.
+    pub tls_cert: String,
+    pub tls_key: String,
+    /// TLS-termination behind a reverse-proxy: trust `X-Forwarded-For`.
+    pub trust_proxy: bool,
+    /// ACME (rustls-acme) — config-gated seam; not implemented in v1.
+    pub acme: bool,
+    /// CORS allowlist of origins for an admin panel on a DIFFERENT origin (e.g.
+    /// `https://admin.example.com`). Empty → the CORS layer is not attached (the panel
+    /// is served from the same origin / behind the same proxy — headers not needed).
+    pub cors_allowed_origins: Vec<String>,
+    /// Public base URL used to render invite URLs (`{public_url}/join#<token>`).
+    /// Empty → the server returns `url: null` and clients compose it themselves.
+    pub public_url: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DbConfig {
+    /// "sqlite" | "postgres".
+    pub backend: String,
+    /// SQLite: path to file (or ":memory:"); Postgres: postgres://...
+    pub url: String,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    pub max_body_bytes: usize,
+    pub max_object_bytes: usize,
+    pub max_objects_per_push: usize,
+    pub delta_page_size: u32,
+    pub delta_max_page_size: u32,
+    pub rate_limit_per_ip_rps: u32,
+    pub rate_limit_burst: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Freshness window W (sec) for online-only live grants (§9.7).
+    pub freshness_window_seconds: i64,
+    /// Defense-in-depth server-side signature validation (§2.4).
+    pub validate_signatures: bool,
+    /// Anti-rollback floor for the whole-DB snapshot (§16): the instance-generation
+    /// (= the instance-wide next_seq) MUST be ≥ this value at startup, otherwise
+    /// the server refuses to come up (a stale snapshot was restored). The operator
+    /// anchors this number outside the DB (like MAX(next_seq) in the backup runbook). 0 = off.
+    pub min_instance_generation: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    pub access_ttl_seconds: i64,
+    pub refresh_ttl_seconds: i64,
+    pub nonce_ttl_seconds: i64,
+    pub invite_default_ttl_seconds: i64,
+    pub relay_ttl_seconds: i64,
+    /// Interval of the background janitor (TTL-cleanup §13).
+    pub janitor_interval_seconds: u64,
+    /// TTL of idempotency keys (the client's retry window, §5.0).
+    pub idempotency_ttl_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObsConfig {
+    /// "json" | "text".
+    pub log_format: String,
+    pub otel_endpoint: String,
+    pub metrics_bind: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpsConfig {
+    /// Operator token (server-trusted) for the infrastructure `/v1/ops/*` surface (the
+    /// `X-UniSSH-Ops-Token` header). Empty → ops surface is DISABLED. This is NOT a keyset and does NOT
+    /// grant decryption — only infrastructure operations (account suspend/seq-bump).
+    pub token: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupConfig {
+    /// Optional fixed setup code (IaC/tests). Empty → generated at boot while unclaimed.
+    pub code: String,
+}
+
+/// One IdP-group → space grant: members whose `groups_claim` contains `group`
+/// are provisioned into `space_id` at `role` on OIDC callback (Phase 5).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GroupMap {
+    pub group: String,
+    pub space_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OidcConfig {
+    /// SSO seam (Phase 5): disabled by default.
+    pub enabled: bool,
+    pub issuer: String,
+    pub client_id: String,
+    /// Expected `aud` in the id_token; empty → the callback falls back to `client_id`.
+    pub audience: String,
+    /// JWKS endpoint; empty → derived by the callback as `{issuer}/.well-known/jwks.json`.
+    pub jwks_url: String,
+    /// The id_token claim name holding the user's group list.
+    pub groups_claim: String,
+    /// IdP-group → space grants applied on callback. Empty by default.
+    pub group_map: Vec<GroupMap>,
+    /// Max age (seconds) an OIDC session may be silently reasserted before a full
+    /// re-authentication is required. Default 7 days.
+    pub max_reassertion_age_seconds: i64,
+}
+
+impl OidcConfig {
+    /// Validate the config at LOAD time so the per-login callback path is INFALLIBLE:
+    /// a single malformed `group_map[].space_id` (bad base64) or an unknown `role`
+    /// would otherwise fail — or silently mis-provision — EVERY SSO login (the
+    /// `ids::unb64`/role handling runs inside the per-login loop). Failing fast at
+    /// startup surfaces the operator's typo immediately instead of at first login.
+    pub fn validate(&self) -> Result<(), String> {
+        use base64::Engine;
+        for (i, gm) in self.group_map.iter().enumerate() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(gm.space_id.as_bytes())
+                .map_err(|_| {
+                    format!(
+                        "oidc.group_map[{i}].space_id is not valid base64: {:?}",
+                        gm.space_id
+                    )
+                })?;
+            // Every space_id in this system is a 16-byte id (`ids::random_id16`); a
+            // different length is certainly a config typo.
+            if bytes.len() != 16 {
+                return Err(format!(
+                    "oidc.group_map[{i}].space_id must decode to a 16-byte space id (got {} bytes)",
+                    bytes.len()
+                ));
+            }
+            // The space-membership role set (server-trusted): 'member' | 'admin'.
+            if gm.role != "member" && gm.role != "admin" {
+                return Err(format!(
+                    "oidc.group_map[{i}].role must be 'member' or 'admin', got {:?}",
+                    gm.role
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[audit]`: where the audit log is exported. Every sink is optional and
+/// configured here only, never through the API, so a compromised admin session
+/// cannot redirect the log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// `[audit.webhook]`. Absent → no webhook sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
+    /// `[audit.syslog]`. Absent → no syslog sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syslog: Option<SyslogConfig>,
+}
+
+/// `[audit.webhook]`: POST batches of entries, HMAC-SHA256 signed.
+///
+/// The shared secret is never a config value: it is read at boot from the
+/// environment variable named by `secret_env` or from the file at
+/// `secret_file`, so it stays out of the TOML that sits next to the URL. This
+/// struct holds only the name/path of the secret. The URL itself often carries
+/// a token (query, path or userinfo), so the manual `Debug` below redacts it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookConfig {
+    pub url: String,
+    /// Name of the environment variable holding the HMAC secret.
+    pub secret_env: String,
+    /// Path of a file holding the HMAC secret (trailing newline ignored).
+    pub secret_file: String,
+    /// Entries per POST.
+    pub batch_size: u32,
+    /// Per-request timeout; a timeout fails the batch.
+    pub timeout_secs: u64,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            secret_env: String::new(),
+            secret_file: String::new(),
+            batch_size: 100,
+            timeout_secs: 10,
+        }
+    }
+}
+
+impl WebhookConfig {
+    /// Every field that names a destination or a secret is empty: the section
+    /// exists only because a deployment passes empty env vars through (e.g.
+    /// `UNISSH__AUDIT__WEBHOOK__URL: "${UNISSH__AUDIT__WEBHOOK__URL:-}"`).
+    fn is_unset(&self) -> bool {
+        self.url.is_empty() && self.secret_env.is_empty() && self.secret_file.is_empty()
+    }
+
+    /// Read the HMAC secret from `secret_env` or `secret_file` (exactly one).
+    /// Errors name the setting, never the value.
+    pub fn resolve_secret(&self) -> Result<Vec<u8>, String> {
+        match (self.secret_env.is_empty(), self.secret_file.is_empty()) {
+            (true, true) => Err(
+                "audit.webhook needs a secret: set secret_env (the name of an \
+                 environment variable) or secret_file (a path)"
+                    .into(),
+            ),
+            (false, false) => Err("audit.webhook: set secret_env or secret_file, not both".into()),
+            (false, true) => match std::env::var(&self.secret_env) {
+                Ok(v) if !v.is_empty() => Ok(v.into_bytes()),
+                _ => Err(format!(
+                    "audit.webhook.secret_env: environment variable {} is unset or empty",
+                    self.secret_env
+                )),
+            },
+            (true, false) => {
+                let raw = std::fs::read(&self.secret_file).map_err(|e| {
+                    format!(
+                        "audit.webhook.secret_file: cannot read {}: {}",
+                        self.secret_file,
+                        e.kind()
+                    )
+                })?;
+                let mut v = raw;
+                while v.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                    v.pop();
+                }
+                if v.is_empty() {
+                    return Err(format!(
+                        "audit.webhook.secret_file: {} is empty",
+                        self.secret_file
+                    ));
+                }
+                Ok(v)
+            }
+        }
+    }
+
+    /// Boot-time validation: a malformed sink is a startup error, not a warning.
+    pub fn validate(&self) -> Result<(), String> {
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|_| "audit.webhook.url is not a valid URL".to_string())?;
+        if url.scheme() != "https" && url.scheme() != "http" {
+            return Err("audit.webhook.url must be http:// or https://".into());
+        }
+        if self.batch_size == 0 {
+            return Err("audit.webhook.batch_size must be at least 1".into());
+        }
+        if self.timeout_secs == 0 {
+            return Err("audit.webhook.timeout_secs must be at least 1".into());
+        }
+        self.resolve_secret().map(|_| ())
+    }
+}
+
+/// `[audit.syslog]`: one RFC 5424 message per entry, over UDP or TCP (RFC 6587
+/// octet counting). No TLS: point it at a local forwarder for that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyslogConfig {
+    /// Collector as `host:port` (a name is resolved at connect time).
+    pub address: String,
+    /// `"udp"` (send and forget) or `"tcp"` (acknowledged by a completed write).
+    pub protocol: String,
+    /// Facility keyword: `kern`, `user`, ..., `auth`, `authpriv`, ..., `local0`..`local7`.
+    pub facility: String,
+    /// RFC 5424 APP-NAME: 1-48 printable ASCII characters, no spaces.
+    pub app_name: String,
+}
+
+impl Default for SyslogConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            protocol: "tcp".into(),
+            facility: "auth".into(),
+            app_name: "unissh".into(),
+        }
+    }
+}
+
+/// RFC 5424 §6.2.1 facility keywords, in code order (0..=23).
+const SYSLOG_FACILITIES: [&str; 24] = [
+    "kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv",
+    "ftp", "ntp", "audit", "alert", "clock", "local0", "local1", "local2", "local3", "local4",
+    "local5", "local6", "local7",
+];
+
+/// `host:port` → (host without IPv6 brackets, non-zero port). An IPv6 host must
+/// be bracketed (`[::1]:514`): unbracketed, `::1:514` is ambiguous and would
+/// never resolve.
+pub fn split_host_port(address: &str) -> Option<(&str, u16)> {
+    let (host, port) = address.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok().filter(|p| *p != 0)?;
+    let host = match host.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']')?,
+        None if host.contains(':') || host.contains(']') => return None,
+        None => host,
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+impl SyslogConfig {
+    /// No destination, and every other field empty or at its default: the
+    /// section exists only because a deployment passes empty env vars through.
+    fn is_unset(&self) -> bool {
+        let d = Self::default();
+        self.address.is_empty()
+            && (self.protocol.is_empty() || self.protocol == d.protocol)
+            && (self.facility.is_empty() || self.facility == d.facility)
+            && (self.app_name.is_empty() || self.app_name == d.app_name)
+    }
+
+    /// An empty optional field (an empty env var passed through) means its default.
+    fn fill_defaults(&mut self) {
+        let d = Self::default();
+        for (v, def) in [
+            (&mut self.protocol, d.protocol),
+            (&mut self.facility, d.facility),
+            (&mut self.app_name, d.app_name),
+        ] {
+            if v.is_empty() {
+                *v = def;
+            }
+        }
+        self.protocol.make_ascii_lowercase();
+    }
+
+    /// The numeric facility (0..=23), or `None` for an unknown keyword.
+    pub fn facility_code(&self) -> Option<u8> {
+        SYSLOG_FACILITIES
+            .iter()
+            .position(|f| f.eq_ignore_ascii_case(&self.facility))
+            .map(|i| i as u8)
+    }
+
+    /// Boot-time validation. The address is checked for shape only (`host:port`
+    /// with a non-zero port): a collector name need not resolve at boot.
+    pub fn validate(&self) -> Result<(), String> {
+        if split_host_port(&self.address).is_none() {
+            return Err(
+                "audit.syslog.address must be host:port (an IPv6 host in brackets: [::1]:514)"
+                    .into(),
+            );
+        }
+        if !self.protocol.eq_ignore_ascii_case("udp") && !self.protocol.eq_ignore_ascii_case("tcp")
+        {
+            return Err("audit.syslog.protocol must be \"udp\" or \"tcp\"".into());
+        }
+        if self.facility_code().is_none() {
+            return Err(format!(
+                "audit.syslog.facility must be one of {}",
+                SYSLOG_FACILITIES.join(", ")
+            ));
+        }
+        let name_ok = (1..=48).contains(&self.app_name.len())
+            && self.app_name.bytes().all(|b| (33..=126).contains(&b));
+        if !name_ok {
+            return Err(
+                "audit.syslog.app_name must be 1-48 printable ASCII characters without spaces"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl AuditConfig {
+    /// Drop sinks whose section is present but entirely empty (see
+    /// `WebhookConfig::is_unset`, `SyslogConfig::is_unset`). A partly set
+    /// section stays and fails validation.
+    pub fn normalize(&mut self) {
+        if self.webhook.as_ref().is_some_and(WebhookConfig::is_unset) {
+            self.webhook = None;
+        }
+        if self.syslog.as_ref().is_some_and(SyslogConfig::is_unset) {
+            self.syslog = None;
+        }
+        if let Some(s) = &mut self.syslog {
+            s.fill_defaults();
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(w) = &self.webhook {
+            w.validate()?;
+        }
+        if let Some(s) = &self.syslog {
+            s.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            client_id: String::new(),
+            audience: String::new(),
+            jwks_url: String::new(),
+            groups_claim: "groups".into(),
+            group_map: Vec::new(),
+            max_reassertion_age_seconds: 604_800,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:8443".into(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            trust_proxy: false,
+            acme: false,
+            cors_allowed_origins: Vec::new(),
+            public_url: String::new(),
+        }
+    }
+}
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            backend: "sqlite".into(),
+            url: "data/unissh.db".into(),
+            max_connections: 16,
+        }
+    }
+}
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: 16 * 1024 * 1024,
+            max_object_bytes: 1024 * 1024,
+            max_objects_per_push: 1000,
+            delta_page_size: 500,
+            delta_max_page_size: 1000,
+            rate_limit_per_ip_rps: 20,
+            rate_limit_burst: 40,
+        }
+    }
+}
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            freshness_window_seconds: 30,
+            validate_signatures: true,
+            min_instance_generation: 0,
+        }
+    }
+}
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 2_592_000,
+            nonce_ttl_seconds: 120,
+            invite_default_ttl_seconds: 86_400,
+            relay_ttl_seconds: 120,
+            janitor_interval_seconds: 300,
+            idempotency_ttl_seconds: 86_400,
+        }
+    }
+}
+impl Default for ObsConfig {
+    fn default() -> Self {
+        Self {
+            log_format: "json".into(),
+            otel_endpoint: String::new(),
+            metrics_bind: "127.0.0.1:9090".into(),
+        }
+    }
+}
+// Manual `Debug` for secret-bearing sub-structs: even an accidental
+// `tracing::debug!(?config)`, a panic message, or an error wrapper must NOT
+// emit tokens / the TLS key / the db-URL (with pg creds) to the logs (obs rule §13).
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind", &self.bind)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &redacted(&self.tls_key))
+            .field("trust_proxy", &self.trust_proxy)
+            .field("acme", &self.acme)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("public_url", &self.public_url)
+            .finish()
+    }
+}
+impl std::fmt::Debug for DbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbConfig")
+            .field("backend", &self.backend)
+            .field("url", &redacted(&self.url))
+            .field("max_connections", &self.max_connections)
+            .finish()
+    }
+}
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("url", &redacted(&self.url))
+            .field("secret_env", &self.secret_env)
+            .field("secret_file", &self.secret_file)
+            .field("batch_size", &self.batch_size)
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
+}
+impl std::fmt::Debug for OpsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpsConfig")
+            .field("token", &redacted(&self.token))
+            .finish()
+    }
+}
+impl std::fmt::Debug for SetupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupConfig")
+            .field("code", &redacted(&self.code))
+            .finish()
+    }
+}
+
+/// `***` for a non-empty secret, `<unset>` for an empty one (presence is not a secret).
+fn redacted(s: &str) -> &'static str {
+    if s.is_empty() { "<unset>" } else { "***" }
+}
+
+impl Config {
+    /// Load: defaults → TOML (if a path is given and exists) → env (`UNISSH__`).
+    pub fn load(toml_path: Option<&Path>) -> Result<Self, Box<figment::Error>> {
+        let mut fig = Figment::from(Serialized::defaults(Config::default()));
+        if let Some(p) = toml_path {
+            if p.exists() {
+                fig = fig.merge(Toml::file(p));
+            }
+        }
+        fig = fig.merge(Env::prefixed("UNISSH__").split("__"));
+        let mut config: Config = fig.extract().map_err(Box::new)?;
+        config.audit.normalize();
+        // Fail fast on a bad OIDC group_map so no per-login SSO path can be broken by
+        // one malformed entry (see `OidcConfig::validate`).
+        config
+            .oidc
+            .validate()
+            .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+        // A configured sink that cannot run (no secret, bad URL) must stop the
+        // boot: a silently idle sink is a log that quietly stops leaving.
+        config
+            .audit
+            .validate()
+            .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+        Ok(config)
+    }
+
+    pub fn is_sqlite(&self) -> bool {
+        self.db.backend.eq_ignore_ascii_case("sqlite")
+    }
+    pub fn is_postgres(&self) -> bool {
+        self.db.backend.eq_ignore_ascii_case("postgres")
+    }
+}
+
+#[cfg(test)]
+mod oidc_validate_tests {
+    use super::{GroupMap, OidcConfig};
+    use base64::Engine;
+
+    fn gm(space_id: &str, role: &str) -> GroupMap {
+        GroupMap {
+            group: "eng".into(),
+            space_id: space_id.into(),
+            role: role.into(),
+        }
+    }
+
+    fn b64_16() -> String {
+        base64::engine::general_purpose::STANDARD.encode([0x5au8; 16])
+    }
+
+    #[test]
+    fn empty_group_map_is_valid() {
+        assert!(OidcConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn valid_entry_passes() {
+        let c = OidcConfig {
+            group_map: vec![gm(&b64_16(), "member"), gm(&b64_16(), "admin")],
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn bad_base64_space_id_fails() {
+        let c = OidcConfig {
+            group_map: vec![gm("not base64!!", "member")],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn wrong_length_space_id_fails() {
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 8]);
+        let c = OidcConfig {
+            group_map: vec![gm(&short, "member")],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_role_fails() {
+        let c = OidcConfig {
+            group_map: vec![gm(&b64_16(), "superuser")],
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_validate_tests {
+    use super::Config;
+
+    #[test]
+    fn webhook_without_a_secret_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[audit.webhook]\nurl = \"https://siem.example.com/hook\"\n",
+        )
+        .unwrap();
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(
+            err.to_string().contains("audit.webhook needs a secret"),
+            "{err}"
+        );
+        // An all-empty section (compose passing `${X:-}` through) means no sink.
+        std::fs::write(&path, "[audit.webhook]\nurl = \"\"\n").unwrap();
+        assert!(Config::load(Some(&path)).unwrap().audit.webhook.is_none());
+    }
+
+    #[test]
+    fn syslog_with_a_bad_setting_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[audit.syslog]\naddress = \"127.0.0.1:514\"\nprotocol = \"tls\"\n",
+        )
+        .unwrap();
+        let err = Config::load(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("audit.syslog.protocol"), "{err}");
+        // An all-empty section (compose passing `${X:-}` through) means no sink.
+        std::fs::write(
+            &path,
+            "[audit.syslog]\naddress = \"\"\nprotocol = \"\"\nfacility = \"\"\n",
+        )
+        .unwrap();
+        assert!(Config::load(Some(&path)).unwrap().audit.syslog.is_none());
+    }
+}

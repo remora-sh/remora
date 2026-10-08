@@ -1,0 +1,2419 @@
+// Secrets — Keys / Passwords / Notes. Reveal + copy, wired to the real vault.
+// Pixel-faithful port of view-secrets.jsx; mock data replaced with store items
+// and api.* calls. Active tab follows store.route (keys|passwords|notes).
+
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { writeSecretToClipboard } from "@/bridge/clipboard";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { useTranslation } from "@/i18n";
+import { usePalette } from "@/theme/ThemeProvider";
+import { MONO, rem, TEXT, UI } from "@/theme/tokens";
+import { Btn, Icon, NO_AUTOCORRECT, Spinner, Tag, Toggle, VaultBadge } from "@/components/primitives";
+import { Modal } from "@/components/Modal";
+import { UnderlineTabs, fmtRelativeUnix, FlatAvatar, MetaChip, RowOverflowMenu, Card, HairlineRow } from "@/components/mono";
+import { useApp } from "@/store/app";
+import { useCtx } from "@/store/ctx";
+import { useNarrow } from "@/store/responsive";
+import * as api from "@/bridge/api";
+import { apiErrorMessage, ItemType } from "@/bridge/types";
+import { logWarn } from "@/bridge/log";
+import type { ConnectionProfile, ItemInfo, Identity, KeyRotationLink, ServerStatus, VaultInfo } from "@/bridge/types";
+import { isOwnedCloud, serverShortLabel, vaultLoc, vaultServer } from "@/bridge/vaults";
+import { exportPath } from "@/support/paths";
+import { isDesktopOs } from "@/bridge/platform";
+import { systemAgentSetShared, systemAgentSharedKeys, systemAgentStatus } from "@/bridge/systemAgent";
+import { guard } from "@/store/action";
+import { isKeyOld, keyUsage, keyUsageCount } from "@/support/keyHygiene";
+import { confirmFinishRotation } from "@/overlays/finishRotation";
+import { useFmt } from "@/i18n/format";
+
+type SecretTab = "keys" | "passwords" | "notes" | "identities";
+
+async function copy(text: string, ok: () => void, fail: (e: unknown) => void) {
+  try {
+    await writeSecretToClipboard(text);
+    ok();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** Transient "copied ✓" flag for copy-to-clipboard buttons: `flash()` turns
+ *  `copied` on, then auto-resets it after `resetMs`. Pass `flash` as the success
+ *  callback of `copy(...)`. */
+function useCopied(resetMs = 1200) {
+  const [copied, setCopied] = useState(false);
+  const flash = () => {
+    setCopied(true);
+    setTimeout(() => setCopied(false), resetMs);
+  };
+  return { copied, flash };
+}
+
+function TabBar({
+  tab,
+  setTab,
+  counts,
+  isMobile,
+}: {
+  tab: SecretTab;
+  setTab: (t: SecretTab) => void;
+  counts: Record<SecretTab, number>;
+  isMobile: boolean;
+}) {
+  const { t } = useTranslation();
+  const tabs: { id: SecretTab; icon: "key" | "lock" | "note" | "fingerprint"; label: string }[] = [
+    { id: "keys", icon: "key", label: t("nav.keys") },
+    { id: "passwords", icon: "lock", label: t("nav.passwords") },
+    { id: "identities", icon: "fingerprint", label: t("nav.identities") },
+    { id: "notes", icon: "note", label: t("nav.notes") },
+  ];
+  return (
+    <div style={{ overflowX: isMobile ? "auto" : "visible", minWidth: 0 }}>
+      <UnderlineTabs<SecretTab>
+        ariaLabel={t("nav.secrets")}
+        value={tab}
+        onChange={setTab}
+        tabs={tabs.map((tb) => ({
+          value: tb.id,
+          label: (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: rem(7) }}>
+              <Icon name={tb.icon} size={15} stroke={1.8} />
+              {tb.label}
+            </span>
+          ),
+          count: counts[tb.id],
+        }))}
+      />
+    </div>
+  );
+}
+
+/** Masked field that lazily reveals its value via `load` on first reveal. */
+function RevealField({
+  load,
+  onError,
+  mono = true,
+}: {
+  load: () => Promise<string>;
+  onError: (e: unknown) => void;
+  mono?: boolean;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [shown, setShown] = useState(false);
+  const { copied, flash } = useCopied();
+  const [value, setValue] = useState<string | null>(null);
+
+  const toggle = async () => {
+    if (shown) {
+      // Hiding: drop the cached plaintext so it doesn't linger in state (showing
+      // again re-reads via load()). Narrows the secret's lifetime in memory.
+      setShown(false);
+      setValue(null);
+      return;
+    }
+    if (value === null) {
+      try {
+        setValue(await load());
+      } catch (e) {
+        onError(e);
+        return;
+      }
+    }
+    setShown(true);
+  };
+
+  const doCopy = async () => {
+    let v = value;
+    if (v === null) {
+      try {
+        v = await load();
+        setValue(v);
+      } catch (e) {
+        onError(e);
+        return;
+      }
+    }
+    await copy(v, flash, onError);
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: rem(8),
+        height: rem(34),
+        padding: `0 ${rem(6)} 0 ${rem(12)}`,
+        borderRadius: 8,
+        background: p.bg0,
+        border: `1px solid ${p.line}`,
+      }}
+    >
+      <span
+        style={{
+          flex: 1,
+          fontFamily: mono ? MONO : UI,
+          fontSize: TEXT.base,
+          color: shown ? p.txt : p.txt3,
+          letterSpacing: shown ? 0 : 2,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+        }}
+      >
+        {shown ? (value ?? "") : "•".repeat(14)}
+      </span>
+      <button
+        onClick={toggle}
+        title={shown ? t("common.hide") : t("common.show")}
+        aria-label={shown ? t("common.hide") : t("common.show")}
+        aria-pressed={shown}
+        style={{
+          width: rem(28),
+          height: rem(26),
+          borderRadius: 8,
+          border: "none",
+          background: "transparent",
+          color: p.txt3,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Icon name="eye" size={15} />
+      </button>
+      <button
+        onClick={doCopy}
+        title={t("common.copy")}
+        aria-label={t("common.copy")}
+        style={{
+          width: rem(28),
+          height: rem(26),
+          borderRadius: 8,
+          border: "none",
+          background: copied ? p.accentSoft : "transparent",
+          color: copied ? p.accentText : p.txt3,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Icon name={copied ? "check" : "copy"} size={14} />
+      </button>
+    </div>
+  );
+}
+
+// ── Keys ───────────────────────────────────────────────────────
+/** The row's part in a staged rotation (from the core's device-local links,
+ *  plus candidates synced from a device that started the rotation — those
+ *  carry `startedElsewhere` and can only be abandoned here):
+ *  `original` — this key has a live candidate; `candidate` — this key IS one. */
+type RotationRole = { role: "original" | "candidate"; link: KeyRotationLink };
+
+function KeyRow({
+  item,
+  isMobile,
+  first,
+  agentShared,
+  onAgentShared,
+  rotation,
+}: {
+  item: ItemInfo;
+  isMobile: boolean;
+  first?: boolean;
+  /** Desktop only: whether this key is offered to the system agent. Absent → no switch. */
+  agentShared?: boolean;
+  onAgentShared?: (shared: boolean) => void;
+  rotation?: RotationRole;
+}) {
+  const p = usePalette();
+  const { t, i18n } = useTranslation();
+  const ctx = useCtx();
+  const { fmtDate } = useFmt();
+  const hosts = useApp((s) => s.hosts);
+  const keyAgeDays = useApp((s) => s.keyAgeDays);
+  const vault = useApp((s) => s.vaultId);
+  const usage = keyUsage(hosts, vault ?? "", item.itemId);
+  const uses = keyUsageCount(usage);
+  const old = isKeyOld(item.createdAt, keyAgeDays, Date.now());
+  const [open, setOpen] = useState(false);
+  const detailsId = `key-details-${item.itemId}`;
+  const [fp, setFp] = useState<string | null>(null);
+  const [openssh, setOpenssh] = useState<string | null>(null);
+  const { copied, flash } = useCopied();
+
+  useEffect(() => {
+    let alive = true;
+    if (!vault) return;
+    (async () => {
+      try {
+        const pk = await api.getPublicKey(vault, item.itemId);
+        if (alive) {
+          setFp(pk.fingerprint);
+          setOpenssh(pk.openssh);
+        }
+      } catch {
+        /* leave unknown */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [vault, item.itemId, item.version]);
+
+  const doCopy = () => {
+    if (!openssh) return;
+    copy(openssh, flash, (e) => ctx.toast(apiErrorMessage(e), "err"));
+  };
+
+  // Export the private key to a user-chosen file (backup/migration). Gated by an
+  // explicit confirm; the save dialog is the second deliberate step.
+  const onExport = () => {
+    if (!vault) return;
+    ctx.confirm({
+      title: t("secrets.exportKeyTitle"),
+      body: t("secrets.exportKeyBody", { item: item.itemId }),
+      danger: true,
+      confirmLabel: t("secrets.exportKeyConfirm"),
+      icon: "download",
+      onConfirm: async () => {
+        try {
+          const pem = await api.exportSshKey(vault, item.itemId);
+          const path = await save({
+        defaultPath: await exportPath(item.itemId),
+        title: t("secrets.exportKeyTitle"),
+      });
+          if (!path) return; // user cancelled the save dialog
+          await writeTextFile(path, pem);
+          ctx.toast(t("secrets.keyExported"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  // Guided rotation: the dialog shows the plan, creates the candidate key on
+  // confirm, and moves each machine over (deploy → verify → remove). Continuing
+  // reopens it for the candidate this device already began.
+  const onStartRotation = () =>
+    ctx.openModal({ kind: "keyRotation", keyItemId: item.itemId, hasCertificate: item.hasCertificate });
+  const onContinueRotation = () => {
+    if (!rotation) return;
+    ctx.openModal({
+      kind: "keyRotation",
+      keyItemId: item.itemId,
+      hasCertificate: item.hasCertificate,
+      candidateId: rotation.link.candidateId,
+    });
+  };
+
+  const onFinishRotation = () => {
+    if (!vault || !rotation) return;
+    const { keyId, candidateId } = rotation.link;
+    confirmFinishRotation(ctx, { vault, keyId, candidateId });
+  };
+
+  const onAbandonRotation = () => {
+    if (!vault || !rotation) return;
+    const { keyId, candidateId, startedElsewhere } = rotation.link;
+    ctx.confirm({
+      title: t("secrets.abandonRotationTitle"),
+      body: t(startedElsewhere ? "secrets.abandonRotationElsewhereBody" : "secrets.abandonRotationBody", {
+        item: keyId,
+        candidate: candidateId,
+      }),
+      danger: true,
+      confirmLabel: t("secrets.abandonRotationConfirm"),
+      icon: "trash",
+      onConfirm: async () => {
+        try {
+          await api.abandonKeyRotation(vault, candidateId);
+          await useApp.getState().reloadVault();
+          ctx.toast(t("secrets.rotationAbandoned"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  // Rotate in place: new keypair under the same item id, so every host
+  // referencing it follows automatically — but the old private key is replaced
+  // at once, so hosts lacking the new public key refuse logins until updated.
+  const onRotate = () => {
+    if (!vault) return;
+    ctx.confirm({
+      title: t("secrets.rotateKeyTitle"),
+      body: t("secrets.rotateKeyBody", { item: item.itemId }),
+      danger: true,
+      confirmLabel: t("secrets.rotateKeyConfirm"),
+      icon: "refresh",
+      onConfirm: async () => {
+        try {
+          await api.rotateSshKey(vault, item.itemId);
+          // Refresh the item list so the row's version + cert badge update
+          // (rotation bumps the version and drops the now-invalid certificate).
+          await useApp.getState().reloadVault();
+          const pk = await api.getPublicKey(vault, item.itemId);
+          setFp(pk.fingerprint);
+          setOpenssh(pk.openssh);
+          ctx.toast(t("secrets.keyRotated"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  const onDelete = () => {
+    if (!vault) return;
+    // Warn if the key still backs any host login (direct auth or a jump hop), so
+    // deleting it doesn't silently break those connections.
+    ctx.confirm({
+      title: t("secrets.deleteKeyTitle"),
+      body: uses > 0 ? t("secrets.deleteKeyInUse", { item: item.itemId, count: uses }) : item.itemId,
+      danger: true,
+      confirmLabel: t("common.delete"),
+      icon: "trash",
+      onConfirm: async () => {
+        try {
+          await api.deleteItem(vault, item.itemId);
+          await useApp.getState().reloadVault();
+          ctx.toast(t("secrets.keyDeleted"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  const actBtn = {
+    width: isMobile ? rem(40) : rem(28),
+    height: isMobile ? rem(40) : rem(28),
+    borderRadius: 8,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  } as const;
+  return (
+    <>
+      <HairlineRow
+        first={first}
+        style={{
+          alignItems: isMobile ? "stretch" : "center",
+          flexDirection: isMobile ? "column" : "row",
+          gap: isMobile ? rem(10) : rem(14),
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: isMobile ? rem(12) : rem(14), minWidth: 0 }}>
+          <span
+            style={{
+              width: rem(40),
+              height: rem(40),
+              borderRadius: 12,
+              background: p.bg3,
+              border: `1px solid ${p.line}`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+            }}
+          >
+            <Icon name="key" size={18} color={p.txt2} />
+          </span>
+          <div style={{ width: isMobile ? "auto" : rem(150), flexShrink: 0, minWidth: 0 }}>
+            <div style={{ fontSize: TEXT.body, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {item.itemId}
+            </div>
+            <div style={{ fontFamily: MONO, fontSize: TEXT.micro, color: p.txt3 }}>
+              {t("secrets.updatedAgo", { ago: fmtRelativeUnix(item.updatedAt, i18n.language) })}
+              {item.hasCertificate ? " · cert" : ""}
+            </div>
+          </div>
+        </div>
+        <span
+          style={{
+            flex: 1,
+            width: isMobile ? "100%" : undefined,
+            fontFamily: MONO,
+            fontSize: TEXT.small,
+            color: p.txt2,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {fp ?? "…"}
+        </span>
+        <MetaChip icon="link" tone={uses === 0 ? "warn" : "neutral"}>
+          {uses === 0 ? t("secrets.unused") : t("secrets.usedByHosts", { count: uses })}
+        </MetaChip>
+        {old && (
+          <span title={t("secrets.keyOldTitle", { days: keyAgeDays })}>
+            <MetaChip icon="clock">{t("secrets.keyOld")}</MetaChip>
+          </span>
+        )}
+        {rotation && (
+          <MetaChip icon="refresh" tone="warn">
+            {rotation.role === "original"
+              ? t(rotation.link.startedElsewhere ? "secrets.rotationPendingElsewhere" : "secrets.rotationPending", {
+                  item: rotation.link.candidateId,
+                })
+              : t(
+                  rotation.link.startedElsewhere
+                    ? "secrets.rotationCandidateOfElsewhere"
+                    : "secrets.rotationCandidateOf",
+                  { item: rotation.link.keyId },
+                )}
+          </MetaChip>
+        )}
+        {agentShared !== undefined && onAgentShared && (
+          <span
+            title={t("systemAgent.offerKeyDesc")}
+            style={{ display: "inline-flex", alignItems: "center", gap: rem(8), flexShrink: 0 }}
+          >
+            <span aria-hidden style={{ fontSize: TEXT.small, color: agentShared ? p.txt : p.txt3 }}>
+              {t("systemAgent.offerKeyShort")}
+            </span>
+            <Toggle
+              checked={agentShared}
+              onChange={onAgentShared}
+              aria-label={t("systemAgent.offerKey", { item: item.itemId })}
+            />
+          </span>
+        )}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: isMobile ? rem(10) : rem(14),
+            flexWrap: isMobile ? "wrap" : "nowrap",
+            justifyContent: isMobile ? "flex-end" : "flex-start",
+          }}
+        >
+          <button
+            onClick={() => setOpen((v) => !v)}
+            title={t("secrets.keyDetails")}
+            aria-label={t("secrets.keyDetails")}
+            aria-expanded={open}
+            aria-controls={detailsId}
+            style={{
+              ...actBtn,
+              border: `1px solid ${p.line}`,
+              background: open ? p.bg3 : p.bg2,
+              color: p.txt3,
+              cursor: "pointer",
+            }}
+          >
+            <Icon name={open ? "cd" : "cr"} size={14} />
+          </button>
+          <button
+            onClick={doCopy}
+            title={t("secrets.copyPublicKey")}
+            aria-label={t("secrets.copyPublicKey")}
+            disabled={!openssh}
+            style={{
+              ...actBtn,
+              border: `1px solid ${p.line}`,
+              background: copied ? p.accentSoft : p.bg2,
+              color: copied ? p.accentText : p.txt3,
+              cursor: openssh ? "pointer" : "default",
+              opacity: openssh ? 1 : 0.5,
+            }}
+          >
+            <Icon name={copied ? "check" : "copy"} size={14} />
+          </button>
+          <RowOverflowMenu
+            ariaLabel={t("secrets.keyActions")}
+            items={[
+              {
+                label: t("secrets.copyToServer"),
+                icon: "upload",
+                onClick: () => {
+                  if (openssh)
+                    ctx.openModal({ kind: "copyKeyToServer", openssh, keyItemId: item.itemId });
+                },
+              },
+              ...(rotation
+                ? [
+                    // Finishing overwrites key material, so it is offered only
+                    // on the device that started the rotation and holds the link.
+                    ...(rotation.link.startedElsewhere
+                      ? []
+                      : [
+                          // Continue runs the plan for the original key, so it lives on that row.
+                          ...(rotation.role === "original"
+                            ? [{ label: t("secrets.continueRotation"), icon: "refresh" as const, onClick: onContinueRotation }]
+                            : []),
+                          { label: t("secrets.finishRotation"), icon: "check" as const, onClick: onFinishRotation },
+                        ]),
+                    { label: t("secrets.abandonRotation"), icon: "x" as const, onClick: onAbandonRotation },
+                  ]
+                : [
+                    { label: t("secrets.startRotation"), icon: "refresh" as const, onClick: onStartRotation },
+                    { label: t("secrets.rotateKey"), icon: "refresh" as const, onClick: onRotate },
+                  ]),
+              { label: t("secrets.exportPrivateKey"), icon: "download", onClick: onExport },
+            ]}
+          />
+          {/* A key in a rotation is removed through Abandon only: a plain delete
+              of the candidate (or of the original under it) skips the warning
+              that machines already switched accept nothing else. */}
+          {!rotation && (
+            <button
+              onClick={onDelete}
+              title={t("common.delete")}
+              aria-label={t("common.delete")}
+              style={{
+                ...actBtn,
+                border: `1px solid ${p.line}`,
+                background: p.bg2,
+                color: p.red,
+                cursor: "pointer",
+              }}
+            >
+              <Icon name="trash" size={14} />
+            </button>
+          )}
+        </div>
+      </HairlineRow>
+      {open && (
+        <div
+          id={detailsId}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: rem(10),
+            padding: `0 ${rem(6)} ${rem(14)} ${isMobile ? rem(6) : rem(60)}`,
+            fontSize: TEXT.small,
+            color: p.txt2,
+          }}
+        >
+          <div style={{ fontFamily: MONO, color: p.txt3 }}>
+            {t("secrets.keyCreated", { date: fmtDate(item.createdAt) || "—" })}
+          </div>
+          {uses === 0 ? (
+            <div>{t("secrets.keyNoHosts")}</div>
+          ) : (
+            <>
+              <KeyHostList label={t("secrets.keyUsedDirect")} hosts={usage.direct} />
+              <KeyHostList label={t("secrets.keyUsedJump")} hosts={usage.jump} />
+            </>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** One "where used" list in a key's details: each host is a button that opens
+ *  its profile. Renders nothing when empty, so a key that only hops shows one. */
+function KeyHostList({ label, hosts }: { label: string; hosts: ConnectionProfile[] }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  if (hosts.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: rem(4) }}>
+      <div style={{ fontSize: TEXT.micro, fontWeight: 700, color: p.txt3, textTransform: "uppercase" }}>
+        {label}
+      </div>
+      <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexWrap: "wrap", gap: rem(6) }}>
+        {hosts.map((h) => (
+          <li key={h.profileId}>
+            <button
+              onClick={() => ctx.openModal({ kind: "host", edit: h })}
+              aria-label={t("secrets.keyOpenHost", { host: h.label })}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: rem(6),
+                padding: `${rem(4)} ${rem(10)}`,
+                borderRadius: 8,
+                border: `1px solid ${p.line}`,
+                background: p.bg2,
+                color: p.txt,
+                cursor: "pointer",
+                fontSize: TEXT.small,
+              }}
+            >
+              <Icon name="server" size={12} color={p.txt3} />
+              {h.label}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function KeysTab({ keys, isMobile }: { keys: ItemInfo[]; isMobile: boolean }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [links, setLinks] = useState<KeyRotationLink[]>([]);
+
+  // Staged rotations (device-local links + synced candidates); re-read whenever the
+  // key set changes (begin/finish/abandon all reload the vault). Keyed on a
+  // signature, not the array, which the parent rebuilds on every render.
+  const keySig = keys.map((k) => `${k.itemId}:${k.version}`).join("\n");
+  useEffect(() => {
+    let alive = true;
+    if (!vault) return;
+    api
+      .listKeyRotations(vault)
+      .then((l) => alive && setLinks(l))
+      .catch((e) => {
+        logWarn(`list key rotations failed: ${apiErrorMessage(e)}`);
+        if (alive) setLinks([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [vault, keySig]);
+
+  const rotationOf = (itemId: string): RotationRole | undefined => {
+    const asOriginal = links.find((l) => l.keyId === itemId);
+    if (asOriginal) return { role: "original", link: asOriginal };
+    const asCandidate = links.find((l) => l.candidateId === itemId);
+    return asCandidate ? { role: "candidate", link: asCandidate } : undefined;
+  };
+
+  // A candidate sits right under its original, so the pair reads as one. It
+  // leaves its own place only when that original is listed to carry it —
+  // otherwise (original deleted) it would vanish with its private key.
+  const keyIds = new Set(keys.map((k) => k.itemId));
+  const placed = new Set(links.filter((l) => keyIds.has(l.keyId)).map((l) => l.candidateId));
+  const ordered = keys.flatMap((k) => {
+    if (placed.has(k.itemId)) return [];
+    const link = links.find((l) => l.keyId === k.itemId);
+    const cand = link && keys.find((c) => c.itemId === link.candidateId);
+    return cand ? [k, cand] : [k];
+  });
+
+  // Desktop only: the keys this device offers to the system agent (device-local,
+  // never synced). Reloaded with the key list, since a rotated key stops being
+  // offered until it is shared again.
+  const [agent, setAgent] = useState(false);
+  useEffect(() => {
+    if (!isDesktopOs()) return;
+    let live = true;
+    systemAgentStatus()
+      .then((st) => {
+        if (live) setAgent(st.supported);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+  const [shared, setShared] = useState<Set<string> | null>(null);
+  const loadShared = async () => {
+    const list = await systemAgentSharedKeys();
+    // A late reply for a vault switched away from must not mark same-named
+    // keys of the current one as shared.
+    if (useApp.getState().vaultId !== vault) return;
+    setShared(new Set(list.filter((k) => k.vaultId === vault).map((k) => k.itemId)));
+  };
+  useEffect(() => {
+    if (!agent || !vault) return;
+    void guard(loadShared);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent, vault, keySig]);
+  const setAgentShared = (itemId: string, on: boolean) => {
+    if (!vault) return;
+    void guard(async () => {
+      await systemAgentSetShared(vault, itemId, on);
+      await loadShared();
+    });
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: rem(12) }}>
+      <div>
+        {ordered.map((k, i) => (
+          <KeyRow
+            key={k.itemId}
+            item={k}
+            isMobile={isMobile}
+            first={i === 0}
+            rotation={rotationOf(k.itemId)}
+            agentShared={agent && shared ? shared.has(k.itemId) : undefined}
+            onAgentShared={agent ? (on) => setAgentShared(k.itemId, on) : undefined}
+          />
+        ))}
+      </div>
+      <button
+        onClick={() => ctx.openModal({ kind: "key" })}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: rem(8),
+          padding: rem(13),
+          borderRadius: 12,
+          border: `1px dashed ${p.line2}`,
+          background: "transparent",
+          color: p.txt2,
+          cursor: "pointer",
+          fontSize: TEXT.base,
+          fontWeight: 600,
+        }}
+      >
+        <Icon name="plus" size={15} />
+        {t("secrets.generateKeyPair")}
+      </button>
+    </div>
+  );
+}
+
+// ── Passwords ──────────────────────────────────────────────────
+function NewPasswordCard({ openSignal }: { openSignal: number }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const nameRef = useRef<HTMLInputElement>(null);
+  const lastSignal = useRef(openSignal);
+
+  // Open from the header "+" button (signal bump). Compare against the mount
+  // value so a tab switch that remounts with a stale signal doesn't auto-open.
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      setOpen(true);
+    }
+  }, [openSignal]);
+  useEffect(() => {
+    if (open) {
+      nameRef.current?.focus();
+      nameRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [open]);
+
+  const save = async () => {
+    if (!vault || !name.trim() || !value) return;
+    try {
+      await api.savePassword(vault, name.trim(), value);
+      await useApp.getState().reloadVault();
+      ctx.toast(t("secrets.passwordSaved"), "ok");
+      setOpen(false);
+      setName("");
+      setValue("");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: rem(8),
+          padding: rem(15),
+          borderRadius: 12,
+          border: `1px dashed ${p.line2}`,
+          background: "transparent",
+          color: p.txt2,
+          cursor: "pointer",
+          fontSize: TEXT.base,
+          fontWeight: 600,
+        }}
+      >
+        <Icon name="plus" size={15} />
+        {t("secrets.newPassword")}
+      </button>
+    );
+  }
+  return (
+    <div style={{ padding: rem(15), borderRadius: 12, background: p.bg1, border: `1px solid ${p.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: rem(12) }}>
+        <span
+          style={{
+            width: rem(34),
+            height: rem(34),
+            borderRadius: 8,
+            background: p.bg3,
+            border: `1px solid ${p.line}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="lock" size={16} color={p.txt2} />
+        </span>
+        <input
+          ref={nameRef}
+          {...NO_AUTOCORRECT}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={t("secrets.namePlaceholder")}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            height: rem(34),
+            padding: `0 ${rem(10)}`,
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg0,
+            color: p.txt,
+            fontFamily: MONO,
+            fontSize: TEXT.base,
+          }}
+        />
+      </div>
+      <input
+        {...NO_AUTOCORRECT}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder={t("secrets.valuePlaceholder")}
+        style={{
+          width: "100%",
+          height: rem(34),
+          padding: `0 ${rem(12)}`,
+          borderRadius: 8,
+          border: `1px solid ${p.line}`,
+          background: p.bg0,
+          color: p.txt,
+          fontFamily: MONO,
+          fontSize: TEXT.base,
+          marginBottom: rem(10),
+        }}
+      />
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn icon="check" size="sm" onClick={save} disabled={!name.trim() || !value}>
+          {t("common.save")}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+/** Earlier versions of a secret, and a reveal for each.
+ *
+ *  The vault has kept these all along — `list_item_versions` and the per-version
+ *  reveals have existed in the core, and through the Tauri layer, since history
+ *  was implemented. Nothing called them, so from the app's side the feature did
+ *  not exist: overwrite a password and the previous one was gone as far as
+ *  anyone could tell. This is the screen that was missing, not the storage.
+ *
+ *  Each version reveals on its own, through the same RevealField as a live
+ *  secret, so an old password is exactly as deliberate to look at as the current
+ *  one and is dropped from memory again on hide. */
+function VersionHistory({
+  itemId,
+  kind,
+  onClose,
+}: {
+  itemId: string;
+  kind: "password" | "note";
+  onClose: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [versions, setVersions] = useState<number[] | null>(null);
+
+  useEffect(() => {
+    if (!vault) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const v = await api.listItemVersions(vault, itemId);
+        // Newest first: the current one is what you came to compare against.
+        if (alive) setVersions([...v].sort((a, b) => b - a));
+      } catch (e) {
+        if (alive) {
+          ctx.toast(apiErrorMessage(e), "err");
+          setVersions([]);
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [vault, itemId, ctx]);
+
+  const current = versions && versions.length ? versions[0] : null;
+
+  return (
+    <Modal
+      icon="clock"
+      title={t("secrets.historyTitle")}
+      subtitle={itemId}
+      onClose={onClose}
+      w={460}
+      footer={
+        <div style={{ display: "flex", justifyContent: "flex-end", width: "100%" }}>
+          <Btn onClick={onClose}>{t("common.done")}</Btn>
+        </div>
+      }
+    >
+      {versions === null ? (
+        <div style={{ display: "flex", alignItems: "center", gap: rem(8), color: p.txt3, fontSize: TEXT.base }}>
+          <Spinner /> {t("serverVaults.loading")}
+        </div>
+      ) : versions.length === 0 ? (
+        <div style={{ fontSize: TEXT.base, color: p.txt3 }}>{t("secrets.historyEmpty")}</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: rem(10) }}>
+          <div style={{ fontSize: TEXT.small, color: p.txt3, lineHeight: 1.5 }}>
+            {t("secrets.historyExplain")}
+          </div>
+          {versions.map((v) => (
+            <div key={v} style={{ display: "flex", flexDirection: "column", gap: rem(5) }}>
+              <div style={{ display: "flex", alignItems: "center", gap: rem(8) }}>
+                <span style={{ fontFamily: MONO, fontSize: TEXT.small, color: p.txt2 }}>v{v}</span>
+                {v === current && <Tag>{t("secrets.historyCurrent")}</Tag>}
+              </div>
+              <RevealField
+                load={() =>
+                  kind === "password"
+                    ? api.getPasswordVersion(vault!, itemId, v)
+                    : api.getNoteVersion(vault!, itemId, v)
+                }
+                onError={(e) => ctx.toast(apiErrorMessage(e), "err")}
+                mono={kind === "password"}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function PasswordCard({ item }: { item: ItemInfo }) {
+  const p = usePalette();
+  const { t, i18n } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [history, setHistory] = useState(false);
+
+  // Edit overwrites the same item id, so any host referencing it follows along.
+  const startEdit = async () => {
+    if (!vault) return;
+    try {
+      setDraft(await api.getPassword(vault, item.itemId));
+      setEditing(true);
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+  const saveEdit = async () => {
+    if (!vault || !draft) return;
+    try {
+      await api.savePassword(vault, item.itemId, draft);
+      await useApp.getState().reloadVault();
+      setEditing(false);
+      ctx.toast(t("secrets.passwordSaved"), "ok");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  const onDelete = () => {
+    if (!vault) return;
+    ctx.confirm({
+      title: t("secrets.deletePasswordTitle"),
+      body: item.itemId,
+      danger: true,
+      confirmLabel: t("common.delete"),
+      icon: "trash",
+      onConfirm: async () => {
+        try {
+          await api.deleteItem(vault, item.itemId);
+          await useApp.getState().reloadVault();
+          ctx.toast(t("secrets.passwordDeleted"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  return (
+    <Card>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: rem(12) }}>
+        <span
+          style={{
+            width: rem(34),
+            height: rem(34),
+            borderRadius: 8,
+            background: p.bg3,
+            border: `1px solid ${p.line}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="lock" size={16} color={p.txt2} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: TEXT.body, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {item.itemId}
+          </div>
+          <div style={{ fontFamily: MONO, fontSize: TEXT.micro, color: p.txt3 }}>
+            {t("secrets.updatedAgo", { ago: fmtRelativeUnix(item.updatedAt, i18n.language) })}
+          </div>
+        </div>
+        <button
+          onClick={() => setHistory(true)}
+          title={t("secrets.historyTitle")}
+          aria-label={t("secrets.historyTitle")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="clock" size={14} />
+        </button>
+        <button
+          onClick={editing ? saveEdit : startEdit}
+          title={editing ? t("common.save") : t("common.edit")}
+          aria-label={editing ? t("common.save") : t("common.edit")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: editing ? p.accentText : p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name={editing ? "check" : "pencil"} size={14} />
+        </button>
+        <button
+          onClick={onDelete}
+          title={t("common.delete")}
+          aria-label={t("common.delete")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="trash" size={14} />
+        </button>
+      </div>
+      {editing ? (
+        <input
+          autoFocus
+          {...NO_AUTOCORRECT}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={t("secrets.valuePlaceholder")}
+          style={{
+            width: "100%",
+            height: rem(34),
+            padding: `0 ${rem(12)}`,
+            borderRadius: 8,
+            border: `1px solid ${p.line2}`,
+            background: p.bg0,
+            color: p.txt,
+            fontFamily: MONO,
+            fontSize: TEXT.base,
+          }}
+        />
+      ) : (
+        <RevealField
+          load={() => api.getPassword(vault!, item.itemId)}
+          onError={(e) => ctx.toast(apiErrorMessage(e), "err")}
+        />
+      )}
+      {history && (
+        <VersionHistory itemId={item.itemId} kind="password" onClose={() => setHistory(false)} />
+      )}
+    </Card>
+  );
+}
+
+function PasswordsTab({
+  passwords,
+  openSignal,
+  isMobile,
+}: {
+  passwords: ItemInfo[];
+  openSignal: number;
+  isMobile: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
+        gap: rem(12),
+      }}
+    >
+      {passwords.map((pw) => (
+        <PasswordCard key={pw.itemId} item={pw} />
+      ))}
+      <NewPasswordCard openSignal={openSignal} />
+    </div>
+  );
+}
+
+// ── Notes ──────────────────────────────────────────────────────
+function NoteCard({ item, first }: { item: ItemInfo; first?: boolean }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [body, setBody] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [history, setHistory] = useState(false);
+  const { copied, flash } = useCopied();
+
+  const reveal = async () => {
+    if (!vault) return;
+    try {
+      const text = await api.getNote(vault, item.itemId);
+      setBody(text);
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  const startEdit = async () => {
+    if (!vault) return;
+    let text = body;
+    if (text === null) {
+      try {
+        text = await api.getNote(vault, item.itemId);
+        setBody(text);
+      } catch (e) {
+        ctx.toast(apiErrorMessage(e), "err");
+        return;
+      }
+    }
+    setDraft(text);
+    setEditing(true);
+  };
+
+  const saveEdit = async () => {
+    if (!vault) return;
+    try {
+      await api.saveNote(vault, item.itemId, draft);
+      await useApp.getState().reloadVault();
+      setBody(draft);
+      setEditing(false);
+      ctx.toast(t("secrets.noteSaved"), "ok");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  const doCopy = async () => {
+    let text = body;
+    if (text === null) {
+      try {
+        text = await api.getNote(vault!, item.itemId);
+        setBody(text);
+      } catch (e) {
+        ctx.toast(apiErrorMessage(e), "err");
+        return;
+      }
+    }
+    await copy(text, flash, (e) => ctx.toast(apiErrorMessage(e), "err"));
+  };
+
+  const onDelete = () => {
+    if (!vault) return;
+    ctx.confirm({
+      title: t("secrets.deleteNoteTitle"),
+      body: item.itemId,
+      danger: true,
+      confirmLabel: t("common.delete"),
+      icon: "trash",
+      onConfirm: async () => {
+        try {
+          await api.deleteItem(vault, item.itemId);
+          await useApp.getState().reloadVault();
+          ctx.toast(t("secrets.noteDeleted"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  return (
+    <HairlineRow first={first} style={{ flexDirection: "column", alignItems: "stretch", gap: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(9), marginBottom: rem(10) }}>
+        <Icon name="note" size={16} color={p.txt2} />
+        <span style={{ fontSize: TEXT.body, fontWeight: 700 }}>{item.itemId}</span>
+        <div style={{ flex: 1 }} />
+        <button
+          onClick={() => setHistory(true)}
+          title={t("secrets.historyTitle")}
+          aria-label={t("secrets.historyTitle")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="clock" size={14} />
+        </button>
+        <button
+          onClick={editing ? saveEdit : startEdit}
+          title={editing ? t("common.save") : t("common.edit")}
+          aria-label={editing ? t("common.save") : t("common.edit")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: editing ? p.accentText : p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name={editing ? "check" : "pencil"} size={14} />
+        </button>
+        <button
+          onClick={doCopy}
+          title={t("common.copy")}
+          aria-label={t("common.copy")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: copied ? p.accentSoft : p.bg2,
+            color: copied ? p.accentText : p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name={copied ? "check" : "copy"} size={14} />
+        </button>
+        <button
+          onClick={onDelete}
+          title={t("common.delete")}
+          aria-label={t("common.delete")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="trash" size={14} />
+        </button>
+      </div>
+      {editing ? (
+        <textarea
+          autoFocus
+          {...NO_AUTOCORRECT}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={5}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            fontFamily: MONO,
+            fontSize: TEXT.base,
+            color: p.txt,
+            lineHeight: 1.7,
+            background: p.bg0,
+            border: `1px solid ${p.line2}`,
+            borderRadius: 8,
+            padding: rem(10),
+          }}
+        />
+      ) : body === null ? (
+        <button
+          onClick={reveal}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: rem(7),
+            padding: `${rem(6)} 0`,
+            background: "transparent",
+            border: "none",
+            color: p.txt3,
+            cursor: "pointer",
+            fontFamily: UI,
+            fontSize: TEXT.base,
+          }}
+        >
+          <Icon name="eye" size={14} />
+          {t("secrets.showNote")}
+        </button>
+      ) : (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: rem(8), marginBottom: rem(6) }}>
+            <button
+              type="button"
+              onClick={() => setBody(null)}
+              title={t("secrets.hideNote")}
+              aria-label={t("secrets.hideNote")}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: rem(6),
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                color: p.txt3,
+                fontFamily: UI,
+                fontSize: TEXT.base,
+                cursor: "pointer",
+              }}
+            >
+              <Icon name="eye" size={14} />
+              {t("secrets.hideNote")}
+            </button>
+            <div style={{ flex: 1 }} />
+            <button
+              type="button"
+              onClick={async () => {
+                await writeSecretToClipboard(body);
+                flash();
+              }}
+              title={t("common.copy")}
+              aria-label={t("common.copy")}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                color: copied ? p.green : p.txt3,
+                cursor: "pointer",
+              }}
+            >
+              <Icon name={copied ? "check" : "copy"} size={14} />
+            </button>
+          </div>
+          <pre
+            style={{
+              margin: 0,
+              fontFamily: MONO,
+              fontSize: TEXT.base,
+              color: p.txt2,
+              lineHeight: 1.7,
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {body}
+          </pre>
+        </div>
+      )}
+      {history && (
+        <VersionHistory itemId={item.itemId} kind="note" onClose={() => setHistory(false)} />
+      )}
+    </HairlineRow>
+  );
+}
+
+function NewNoteCard({ openSignal }: { openSignal: number }) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const vault = useApp((s) => s.vaultId);
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [text, setText] = useState("");
+  const nameRef = useRef<HTMLInputElement>(null);
+  const lastSignal = useRef(openSignal);
+
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      setOpen(true);
+    }
+  }, [openSignal]);
+  useEffect(() => {
+    if (open) {
+      nameRef.current?.focus();
+      nameRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [open]);
+
+  const save = async () => {
+    if (!vault || !name.trim()) return;
+    try {
+      await api.saveNote(vault, name.trim(), text);
+      await useApp.getState().reloadVault();
+      ctx.toast(t("secrets.noteSaved"), "ok");
+      setOpen(false);
+      setName("");
+      setText("");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: rem(8),
+          padding: rem(16),
+          borderRadius: 12,
+          border: `1px dashed ${p.line2}`,
+          background: "transparent",
+          color: p.txt2,
+          cursor: "pointer",
+          fontSize: TEXT.base,
+          fontWeight: 600,
+        }}
+      >
+        <Icon name="plus" size={15} />
+        {t("secrets.newNote")}
+      </button>
+    );
+  }
+  return (
+    <div style={{ padding: rem(16), borderRadius: 12, background: p.bg1, border: `1px solid ${p.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(9), marginBottom: rem(10) }}>
+        <Icon name="note" size={16} color={p.txt2} />
+        <input
+          ref={nameRef}
+          {...NO_AUTOCORRECT}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={t("secrets.namePlaceholder")}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            height: rem(32),
+            padding: `0 ${rem(10)}`,
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg0,
+            color: p.txt,
+            fontFamily: MONO,
+            fontSize: TEXT.base,
+          }}
+        />
+      </div>
+      <textarea
+        {...NO_AUTOCORRECT}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+        placeholder={t("secrets.noteTextPlaceholder")}
+        style={{
+          width: "100%",
+          resize: "vertical",
+          fontFamily: MONO,
+          fontSize: TEXT.base,
+          color: p.txt,
+          lineHeight: 1.7,
+          background: p.bg0,
+          border: `1px solid ${p.line2}`,
+          borderRadius: 8,
+          padding: rem(10),
+          marginBottom: rem(10),
+        }}
+      />
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn icon="check" size="sm" onClick={save} disabled={!name.trim()}>
+          {t("common.save")}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function NotesTab({ notes, openSignal }: { notes: ItemInfo[]; openSignal: number }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: rem(12) }}>
+      <div>
+        {notes.map((n, i) => (
+          <NoteCard key={n.itemId} item={n} first={i === 0} />
+        ))}
+      </div>
+      <NewNoteCard openSignal={openSignal} />
+    </div>
+  );
+}
+
+// ── Identities ─────────────────────────────────────────────────
+// A personal identity = a username + an optional reference to a key or password
+// item in the SAME vault. Lives in a personal vault; linked to a shared host via
+// a binding (B3). The credential picker below only lists this vault's keys/pws.
+const selectStyle = (p: ReturnType<typeof usePalette>) => ({
+  width: "100%",
+  height: rem(34),
+  padding: `0 ${rem(10)}`,
+  borderRadius: 8,
+  border: `1px solid ${p.line}`,
+  background: p.bg0,
+  color: p.txt,
+  fontFamily: MONO,
+  fontSize: TEXT.base,
+});
+
+// Encode a chosen credential as "none" | "key:<id>" | "pw:<id>".
+function credToFields(cred: string): { keyItemId: string | null; passwordItemId: string | null } {
+  if (cred.startsWith("key:")) return { keyItemId: cred.slice(4), passwordItemId: null };
+  if (cred.startsWith("pw:")) return { keyItemId: null, passwordItemId: cred.slice(3) };
+  return { keyItemId: null, passwordItemId: null };
+}
+function fieldsToCred(id: Identity): string {
+  if (id.keyItemId) return `key:${id.keyItemId}`;
+  if (id.passwordItemId) return `pw:${id.passwordItemId}`;
+  return "none";
+}
+
+function CredSelect({
+  keys,
+  passwords,
+  value,
+  onChange,
+}: {
+  keys: ItemInfo[];
+  passwords: ItemInfo[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} style={selectStyle(p)}>
+      <option value="none">{t("secrets.identityNoCred")}</option>
+      {keys.map((k) => (
+        <option key={`key:${k.itemId}`} value={`key:${k.itemId}`}>
+          {t("auth.key")}: {k.itemId}
+        </option>
+      ))}
+      {passwords.map((pw) => (
+        <option key={`pw:${pw.itemId}`} value={`pw:${pw.itemId}`}>
+          {t("auth.password")}: {pw.itemId}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function NewIdentityCard({
+  openSignal,
+  keys,
+  passwords,
+  vault,
+  onChanged,
+}: {
+  openSignal: number;
+  keys: ItemInfo[];
+  passwords: ItemInfo[];
+  vault: string;
+  onChanged: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [user, setUser] = useState("");
+  const [cred, setCred] = useState("none");
+  const nameRef = useRef<HTMLInputElement>(null);
+  const lastSignal = useRef(openSignal);
+
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      setOpen(true);
+    }
+  }, [openSignal]);
+  useEffect(() => {
+    if (open) {
+      nameRef.current?.focus();
+      nameRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [open]);
+
+  const save = async () => {
+    if (!vault || !name.trim() || !user.trim()) return;
+    try {
+      await api.saveIdentity(vault, {
+        identityId: name.trim(),
+        label: name.trim(),
+        user: user.trim(),
+        ...credToFields(cred),
+      });
+      onChanged();
+      ctx.toast(t("secrets.identitySaved"), "ok");
+      setOpen(false);
+      setName("");
+      setUser("");
+      setCred("none");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: rem(8),
+          padding: rem(15),
+          borderRadius: 12,
+          border: `1px dashed ${p.line2}`,
+          background: "transparent",
+          color: p.txt2,
+          cursor: "pointer",
+          fontSize: TEXT.base,
+          fontWeight: 600,
+        }}
+      >
+        <Icon name="plus" size={15} />
+        {t("secrets.newIdentity")}
+      </button>
+    );
+  }
+  return (
+    <div style={{ padding: rem(15), borderRadius: 12, background: p.bg1, border: `1px solid ${p.line}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: rem(12) }}>
+        <span
+          style={{
+            width: rem(34),
+            height: rem(34),
+            borderRadius: 8,
+            background: p.bg3,
+            border: `1px solid ${p.line}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="fingerprint" size={16} color={p.txt2} />
+        </span>
+        <input
+          ref={nameRef}
+          {...NO_AUTOCORRECT}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={t("secrets.identityNamePlaceholder")}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            height: rem(34),
+            padding: `0 ${rem(10)}`,
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg0,
+            color: p.txt,
+            fontFamily: MONO,
+            fontSize: TEXT.base,
+          }}
+        />
+      </div>
+      <input
+        {...NO_AUTOCORRECT}
+        value={user}
+        onChange={(e) => setUser(e.target.value)}
+        placeholder={t("secrets.identityUserPlaceholder")}
+        style={{
+          width: "100%",
+          height: rem(34),
+          padding: `0 ${rem(12)}`,
+          borderRadius: 8,
+          border: `1px solid ${p.line}`,
+          background: p.bg0,
+          color: p.txt,
+          fontFamily: MONO,
+          fontSize: TEXT.base,
+          marginBottom: rem(10),
+        }}
+      />
+      <div style={{ marginBottom: rem(10) }}>
+        <CredSelect keys={keys} passwords={passwords} value={cred} onChange={setCred} />
+      </div>
+      <div style={{ display: "flex", gap: rem(8), justifyContent: "flex-end" }}>
+        <Btn variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          {t("common.cancel")}
+        </Btn>
+        <Btn icon="check" size="sm" onClick={save} disabled={!name.trim() || !user.trim()}>
+          {t("common.save")}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function IdentityCard({
+  item,
+  keys,
+  passwords,
+  vault,
+  onChanged,
+}: {
+  item: ItemInfo;
+  keys: ItemInfo[];
+  passwords: ItemInfo[];
+  vault: string;
+  onChanged: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const [ident, setIdent] = useState<Identity | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [user, setUser] = useState("");
+  const [cred, setCred] = useState("none");
+
+  useEffect(() => {
+    if (!vault) return;
+    api
+      .getIdentity(vault, item.itemId)
+      .then(setIdent)
+      .catch(() => {});
+  }, [vault, item.itemId]);
+
+  const startEdit = () => {
+    if (!ident) return;
+    setUser(ident.user);
+    setCred(fieldsToCred(ident));
+    setEditing(true);
+  };
+  const saveEdit = async () => {
+    if (!vault || !user.trim()) return;
+    try {
+      await api.saveIdentity(vault, {
+        identityId: item.itemId,
+        label: ident?.label || item.itemId,
+        user: user.trim(),
+        ...credToFields(cred),
+      });
+      setIdent(await api.getIdentity(vault, item.itemId));
+      onChanged();
+      setEditing(false);
+      ctx.toast(t("secrets.identitySaved"), "ok");
+    } catch (e) {
+      ctx.toast(apiErrorMessage(e), "err");
+    }
+  };
+  const onDelete = async () => {
+    if (!vault) return;
+    // Best-effort usage check: how many host bindings still point at this identity,
+    // so deleting it flags the logins it would leave unbound.
+    let uses = 0;
+    try {
+      const bindings = await api.listBindings(vault);
+      uses = bindings.filter((b) => b.identityItemId === item.itemId).length;
+    } catch {
+      /* bindings unavailable — fall back to the plain confirm */
+    }
+    ctx.confirm({
+      title: t("secrets.deleteIdentityTitle"),
+      body:
+        uses > 0 ? t("secrets.deleteIdentityInUse", { item: item.itemId, count: uses }) : item.itemId,
+      danger: true,
+      confirmLabel: t("common.delete"),
+      icon: "trash",
+      onConfirm: async () => {
+        try {
+          await api.deleteIdentity(vault, item.itemId);
+          onChanged();
+          ctx.toast(t("secrets.identityDeleted"), "ok");
+        } catch (e) {
+          ctx.toast(apiErrorMessage(e), "err");
+        }
+      },
+    });
+  };
+
+  const credLabel = ident?.keyItemId
+    ? `${t("auth.key")}: ${ident.keyItemId}`
+    : ident?.passwordItemId
+      ? `${t("auth.password")}: ${ident.passwordItemId}`
+      : t("secrets.identityNoCred");
+
+  return (
+    <Card>
+      <div style={{ display: "flex", alignItems: "center", gap: rem(10), marginBottom: editing ? rem(12) : 0 }}>
+        <span
+          style={{
+            width: rem(34),
+            height: rem(34),
+            borderRadius: 8,
+            background: p.bg3,
+            border: `1px solid ${p.line}`,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="fingerprint" size={16} color={p.txt2} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: TEXT.body,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {item.itemId}
+          </div>
+          <div style={{ fontFamily: MONO, fontSize: TEXT.micro, color: p.txt3 }}>
+            {ident ? `${ident.user || "—"} · ${credLabel}` : `v${item.version}`}
+          </div>
+        </div>
+        <button
+          onClick={editing ? saveEdit : startEdit}
+          title={editing ? t("common.save") : t("common.edit")}
+          aria-label={editing ? t("common.save") : t("common.edit")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: editing ? p.accentText : p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name={editing ? "check" : "pencil"} size={14} />
+        </button>
+        <button
+          onClick={onDelete}
+          title={t("common.delete")}
+          aria-label={t("common.delete")}
+          style={{
+            width: rem(28),
+            height: rem(28),
+            borderRadius: 8,
+            border: `1px solid ${p.line}`,
+            background: p.bg2,
+            color: p.txt3,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="trash" size={14} />
+        </button>
+      </div>
+      {editing && (
+        <div style={{ display: "flex", flexDirection: "column", gap: rem(10) }}>
+          <input
+            autoFocus
+            {...NO_AUTOCORRECT}
+            value={user}
+            onChange={(e) => setUser(e.target.value)}
+            placeholder={t("secrets.identityUserPlaceholder")}
+            style={{
+              width: "100%",
+              height: rem(34),
+              padding: `0 ${rem(12)}`,
+              borderRadius: 8,
+              border: `1px solid ${p.line2}`,
+              background: p.bg0,
+              color: p.txt,
+              fontFamily: MONO,
+              fontSize: TEXT.base,
+            }}
+          />
+          <CredSelect keys={keys} passwords={passwords} value={cred} onChange={setCred} />
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Identity-vault picker in the app's own switcher idiom (matching the sidebar
+ *  VaultSwitcher): gradient avatar + name + location badge, a dropdown of YOUR private
+ *  vaults, and a "create identity vault" action that keeps you in the identities context. */
+function IdentityVaultSwitcher({
+  vaults,
+  servers,
+  selected,
+  onSelect,
+  onCreate,
+}: {
+  vaults: VaultInfo[];
+  servers: ServerStatus[];
+  selected: string;
+  onSelect: (id: string) => void;
+  onCreate: () => void;
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const cur = vaults.find((v) => v.vaultId === selected) ?? vaults[0];
+  if (!cur) return null;
+
+  const badgeLabel = (v: VaultInfo) => {
+    const loc = vaultLoc(v, servers);
+    if (loc.local) return t("secrets.locLocal");
+    // Prefer the space/server name (needs a session); else resolve the server
+    // session-independently; else it's bound to nothing.
+    const server =
+      loc.server ??
+      (vaultServer(v, servers) ? serverShortLabel(vaultServer(v, servers)!) : null);
+    return server
+      ? t("secrets.locCloud", { server })
+      : t("secrets.locCloud", { server: t("vault.badgeUnbound") });
+  };
+  const avatar = (v: VaultInfo, sz: number) => <FlatAvatar name={v.name} size={sz} />;
+  const row = (base: string): CSSProperties => ({
+    display: "flex",
+    alignItems: "center",
+    gap: rem(10),
+    padding: rem(8),
+    borderRadius: 8,
+    cursor: "pointer",
+    background: base,
+  });
+
+  return (
+    <div style={{ position: "relative", maxWidth: rem(440) }}>
+      <div style={{ fontSize: TEXT.micro, fontWeight: 600, color: p.txt3, marginBottom: rem(6) }}>
+        {t("secrets.identityVaultCaption")}
+      </div>
+      <div
+        onClick={() => setOpen(!open)}
+        style={{
+          padding: `${rem(9)} ${rem(11)}`,
+          borderRadius: 12,
+          background: p.bg1,
+          border: `1px solid ${open ? p.accentLine : p.line}`,
+          display: "flex",
+          alignItems: "center",
+          gap: rem(10),
+          cursor: "pointer",
+        }}
+      >
+        {avatar(cur, 30)}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: TEXT.base,
+              fontWeight: 700,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {cur.name}
+          </div>
+          <div style={{ marginTop: rem(3) }}>
+            <VaultBadge target={cur.syncTarget} label={badgeLabel(cur)} size={11} />
+          </div>
+        </div>
+        <Icon
+          name={open ? "cr" : "cd"}
+          size={15}
+          color={p.txt3}
+          style={{ transform: open ? "rotate(90deg)" : "none", flexShrink: 0 }}
+        />
+      </div>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
+          <div
+            style={{
+              position: "absolute",
+              top: "100%",
+              left: 0,
+              right: 0,
+              marginTop: rem(6),
+              zIndex: 41,
+              background: p.bg3,
+              border: `1px solid ${p.line2}`,
+              borderRadius: 12,
+              padding: rem(6),
+              boxShadow: p.shadow,
+              maxHeight: rem(320),
+              overflowY: "auto",
+            }}
+          >
+            {vaults.map((x) => (
+              <div
+                key={x.vaultId}
+                onClick={() => {
+                  onSelect(x.vaultId);
+                  setOpen(false);
+                }}
+                style={row(x.vaultId === cur.vaultId ? p.bg4 : "transparent")}
+                onMouseEnter={(e) => {
+                  if (x.vaultId !== cur.vaultId) e.currentTarget.style.background = p.bg2;
+                }}
+                onMouseLeave={(e) => {
+                  if (x.vaultId !== cur.vaultId) e.currentTarget.style.background = "transparent";
+                }}
+              >
+                {avatar(x, 24)}
+                <span
+                  style={{
+                    flex: 1,
+                    fontSize: TEXT.base,
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {x.name}
+                </span>
+                <VaultBadge target={x.syncTarget} label={badgeLabel(x)} size={11} />
+                {x.vaultId === cur.vaultId && <Icon name="check" size={14} color={p.accentText} />}
+              </div>
+            ))}
+            <div style={{ height: 1, background: p.line, margin: `${rem(6)} ${rem(4)}` }} />
+            <div
+              onClick={() => {
+                onCreate();
+                setOpen(false);
+              }}
+              style={{ ...row("transparent"), color: p.accentText }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = p.bg2)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              <span
+                style={{
+                  width: rem(24),
+                  height: rem(24),
+                  borderRadius: 6,
+                  border: `1px dashed ${p.accentLine}`,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <Icon name="plus" size={13} color={p.accentText} />
+              </span>
+              <span style={{ fontSize: TEXT.base, fontWeight: 600 }}>{t("secrets.newIdentityVault")}</span>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function IdentitiesTab({
+  openSignal,
+  isMobile,
+  privateVaults,
+}: {
+  openSignal: number;
+  isMobile: boolean;
+  /** The account's PRIVATE vaults (local, or cloud in a space you own) — the only
+   *  valid homes for identities. Identities live here, not in a shared team vault. */
+  privateVaults: VaultInfo[];
+}) {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const servers = useApp((s) => s.servers);
+  const openModal = useApp((s) => s.openModal);
+  const [vault, setVault] = useState<string>("");
+  const [reload, setReload] = useState(0);
+  const [items, setItems] = useState<ItemInfo[]>([]);
+
+  // Open the vault modal and select the vault it creates. NOT silently auto-created:
+  // a company member picks Local vs a Cloud vault in their own Space, rather than being
+  // defaulted onto on-device storage.
+  const newVault = () => openModal({ kind: "identityVault", onCreated: (id) => setVault(id) });
+
+  // Keep a valid selection. Prefer a cloud vault in a Space YOU own (company-perimeter
+  // identities) over a local one, so company identities don't default to on-device.
+  useEffect(() => {
+    if (privateVaults.length && !privateVaults.some((v) => v.vaultId === vault)) {
+      const owned = privateVaults.find((v) => isOwnedCloud(v, servers));
+      setVault((owned ?? privateVaults[0]).vaultId);
+    }
+  }, [privateVaults, servers, vault]);
+
+  // Bridge: the host-binding UI still resolves the default identity vault via the
+  // account-state pointer. Once we have a private vault, make sure that pointer is set
+  // so binding keeps working until it becomes fully multi-vault (next increment).
+  useEffect(() => {
+    if (!vault) return;
+    api
+      .getPersonalVault()
+      .then((pv) => {
+        if (!pv) void api.setPersonalVault(vault);
+      })
+      .catch(() => {});
+  }, [vault]);
+
+  // Load the selected vault's items (identities + keys/passwords for the cred pickers).
+  useEffect(() => {
+    if (!vault) {
+      setItems([]);
+      return;
+    }
+    let alive = true;
+    api
+      .listItems(vault)
+      .then((its) => alive && setItems(its))
+      .catch(() => alive && setItems([]));
+    return () => {
+      alive = false;
+    };
+  }, [vault, reload]);
+
+  const identities = items.filter((i) => i.itemType === ItemType.Identity);
+  const keys = items.filter((i) => i.itemType === ItemType.SshKey);
+  const passwords = items.filter((i) => i.itemType === ItemType.Password);
+  const onChanged = () => setReload((n) => n + 1);
+
+  if (!privateVaults.length) {
+    return (
+      <div
+        style={{
+          border: `1px dashed ${p.line}`,
+          borderRadius: 12,
+          background: "transparent",
+          padding: `${rem(20)} ${rem(18)}`,
+          display: "flex",
+          flexDirection: "column",
+          gap: rem(10),
+          alignItems: "flex-start",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: rem(8) }}>
+          <Icon name="fingerprint" size={16} color={p.txt2} />
+          <span style={{ fontSize: TEXT.base, fontWeight: 700 }}>{t("secrets.noIdentityVaultTitle")}</span>
+        </div>
+        <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.55, maxWidth: rem(470) }}>
+          {t("secrets.noIdentityVaultHint")}
+        </div>
+        <Btn icon="plus" onClick={newVault}>
+          {t("secrets.newIdentityVault")}
+        </Btn>
+      </div>
+    );
+  }
+  if (!vault) return null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: rem(12) }}>
+      {/* The vault IS the context here — everything below lives in it. Pick a cloud vault
+          in a Space you OWN to keep company identities in the company's perimeter, or a
+          local one for on-device. A shared team vault can never hold identities. */}
+      <IdentityVaultSwitcher
+        vaults={privateVaults}
+        servers={servers}
+        selected={vault}
+        onSelect={setVault}
+        onCreate={newVault}
+      />
+      {identities.length === 0 && (
+        <div style={{ fontSize: TEXT.base, color: p.txt3, lineHeight: 1.5, padding: `0 ${rem(2)}` }}>
+          {t("secrets.vaultEmptyHint")}
+        </div>
+      )}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: isMobile ? "1fr" : "repeat(2, 1fr)",
+          gap: rem(12),
+        }}
+      >
+        {identities.map((id) => (
+          <IdentityCard
+            key={id.itemId}
+            item={id}
+            keys={keys}
+            passwords={passwords}
+            vault={vault}
+            onChanged={onChanged}
+          />
+        ))}
+        <NewIdentityCard
+          openSignal={openSignal}
+          keys={keys}
+          passwords={passwords}
+          vault={vault}
+          onChanged={onChanged}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Screen ─────────────────────────────────────────────────────
+export function ViewSecrets() {
+  const p = usePalette();
+  const { t } = useTranslation();
+  const ctx = useCtx();
+  const isMobile = useNarrow(); // width-aware: also true on a narrow desktop window
+  const route = useApp((s) => s.route);
+  const items = useApp((s) => s.items);
+  const vaults = useApp((s) => s.vaults);
+  const servers = useApp((s) => s.servers);
+  // Identities live in one of YOUR PRIVATE vaults (local, or a cloud vault in a space
+  // you own) — never a shared team vault (would leak to members). The Identities tab
+  // manages them across those vaults; the core enforces single-member on write.
+  const privateVaults = vaults.filter(
+    (v) => v.syncTarget !== "cloud" || isOwnedCloud(v, servers),
+  );
+
+  const tab: SecretTab =
+    route === "passwords"
+      ? "passwords"
+      : route === "notes"
+        ? "notes"
+        : route === "identities"
+          ? "identities"
+          : "keys";
+
+  const keys = items.filter((i) => i.itemType === ItemType.SshKey);
+  const passwords = items.filter((i) => i.itemType === ItemType.Password);
+  const notes = items.filter((i) => i.itemType === ItemType.Note);
+  const identities = items.filter((i) => i.itemType === ItemType.Identity);
+
+  const counts: Record<SecretTab, number> = {
+    keys: keys.length,
+    passwords: passwords.length,
+    notes: notes.length,
+    identities: identities.length,
+  };
+
+  const setTab = (t: SecretTab) => ctx.go(t);
+
+  // Bumped by the header "+" button to open the inline add-card on the active tab.
+  const [addSignal, setAddSignal] = useState(0);
+
+  const primaryLabel =
+    tab === "keys"
+      ? t("secrets.newKey")
+      : tab === "passwords"
+        ? t("secrets.newPassword")
+        : tab === "identities"
+          ? t("secrets.newIdentity")
+          : t("secrets.newNote");
+  const onPrimary = () => {
+    if (tab === "keys") ctx.openModal({ kind: "key" });
+    // Identities open the inline add-card in the IdentitiesTab (which targets the
+    // selected private vault), so no personal-vault gate anymore.
+    else setAddSignal((n) => n + 1);
+  };
+
+  return (
+    // Entry motion comes from the uh-stagger body rise below — no root fade on top.
+    <div
+      style={{
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        minWidth: 0,
+        background: p.bg0,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: isMobile ? rem(10) : rem(14),
+          // Always wrap: long RU tab strip + primary button overlap on desktop otherwise.
+          flexWrap: "wrap",
+          rowGap: rem(8),
+          padding: isMobile ? `${rem(14)} ${rem(14)} ${rem(10)}` : `${rem(16)} ${rem(22)} ${rem(12)}`,
+        }}
+      >
+        <h1 style={{ margin: 0, fontSize: TEXT.h2, fontWeight: 800, letterSpacing: rem(-0.7) }}>{t("secrets.title")}</h1>
+        <TabBar tab={tab} setTab={setTab} counts={counts} isMobile={isMobile} />
+        <div style={{ flex: 1 }} />
+        <Btn icon="plus" size="sm" onClick={onPrimary}>
+          {primaryLabel}
+        </Btn>
+      </div>
+
+      <div
+        className="uh-stagger"
+        style={{ flex: 1, overflow: "auto", padding: isMobile ? `${rem(6)} ${rem(14)} ${rem(18)}` : `${rem(6)} ${rem(22)} ${rem(18)}` }}
+      >
+        {tab === "keys" && <KeysTab keys={keys} isMobile={isMobile} />}
+        {tab === "passwords" && <PasswordsTab passwords={passwords} openSignal={addSignal} isMobile={isMobile} />}
+        {tab === "identities" && (
+          <IdentitiesTab openSignal={addSignal} isMobile={isMobile} privateVaults={privateVaults} />
+        )}
+        {tab === "notes" && <NotesTab notes={notes} openSignal={addSignal} />}
+      </div>
+    </div>
+  );
+}

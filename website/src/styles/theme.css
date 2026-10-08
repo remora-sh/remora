@@ -1,0 +1,185 @@
+/* ============================================================
+   UniSSH — design tokens.
+
+   The --uh-* values mirror the product's NEBULA family, dark mode
+   (client/src/theme/tokens.ts → DARK, spread with ACCENTS.blue by
+   buildPalette). They are kept in sync by hand; this file is NOT
+   generated, and it is NOT the app's default look:
+
+     The app's default family is `mono` (near-white ink accent),
+     not `nebula` (blue). ThemeProvider's v2→v3 migration flips an
+     unset/`nebula` family to `mono`. The site deliberately shows
+     the Nebula family, which the product ships but the user opts
+     into. If the client's default family changes, revisit this.
+
+   The --site-* values are brand-surface only. They exist here and
+   nowhere in the product: the marketing ground, the nebula sky and
+   the violet→blue gradient are the site's own voice. PRODUCT.md
+   scopes the website as a `brand` surface, so this is intentional.
+   ============================================================ */
+
+/* Fonts (self-hosted via @fontsource). */
+@import '@fontsource/hanken-grotesk/400.css';
+@import '@fontsource/hanken-grotesk/500.css';
+@import '@fontsource/hanken-grotesk/600.css';
+@import '@fontsource/hanken-grotesk/700.css';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+
+:root {
+  /* ---- Product surfaces (tokens.ts DARK) ---- */
+  --uh-desk: #08090d;
+  --uh-bg0: #0c0e14;
+  --uh-bg1: #10131c;
+  --uh-bg2: #161a26;
+  --uh-bg3: #1b2030;
+  --uh-bg4: #232a3d;
+
+  /* ---- Product text ----
+     txt3 is #8b93ac, NOT #646c85. The client deleted #646c85 for
+     failing WCAG (~3.4:1 on bg0); this file shipped it anyway and
+     leaked it into the Starlight chrome via --sl-color-gray-3.
+     Do not "restore" it. */
+  --uh-txt: #eef0f7;
+  --uh-txt2: #9aa1b8;
+  --uh-txt3: #8b93ac;
+
+  /* ---- Product accent (nebula / ACCENTS.blue) ---- */
+  --uh-accent: #5b8cff;
+  --uh-accent2: #7aa2ff;
+  --uh-accent-soft: rgba(91, 140, 255, 0.15);
+  --uh-accent-line: rgba(91, 140, 255, 0.4);
+  --uh-glow: rgba(91, 140, 255, 0.22);
+  /* No accentInk token here, because nothing on the site needs one: the only
+     white-on-accent is the app's own logo mark, mirrored in AppWindow, and
+     the app really does that (primitives.tsx Logo: background p.accent,
+     color #fff — 3.16:1). It is a logotype, which WCAG 1.4.3 exempts, so the
+     mock is faithful and correct. Where the app puts a LABEL on an accent
+     fill it uses accentInk (= bg0) instead, precisely because white fails
+     there. Don't "fix" the mock's logo to match this note; the note was
+     wrong before, not the mock. */
+
+  /* ---- Product status / secondary ---- */
+  --uh-green: #3ad29f;
+  --uh-amber: #ffb454;
+  --uh-red: #ff6b80;
+  --uh-purple: #b98cff;
+
+  /* ---- Product borders ---- */
+  --uh-line: rgba(255, 255, 255, 0.07);
+  --uh-line2: rgba(255, 255, 255, 0.13);
+
+  /* ---- Terminal theme "UniSSH Nebula" (tokens.ts TERM_THEMES) ---- */
+  --uh-term-bg: #0c0e16;
+  --uh-term-fg: #d8def2;
+  --uh-term-dim: #565d78;
+  --uh-term-green: #3ad29f;
+  --uh-term-blue: #5b8cff;
+  --uh-term-purple: #b98cff;
+  --uh-term-cyan: #57c7ff;
+  --uh-term-red: #ff6b8b;
+  --uh-term-yellow: #ffcf6b;
+
+  /* ---- Fonts ---- */
+  --uh-font-ui: 'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+  --uh-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  /* ---- Shadows ---- */
+  --uh-shadow-card: 0 24px 70px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.05);
+
+  /* ============================================================
+     Brand surface — site only.
+     ============================================================ */
+  --site-ground: #070911;
+  --site-ink: #ffffff;
+  --site-ink2: #9aa3c4; /* 7.96:1 on ground */
+  --site-ink3: #767f9e; /* 5.02:1 on ground */
+  --site-violet: #8b5cf6;
+  --site-violet-lite: #a78bfa; /* 7.31:1 on ground */
+  --site-blue: #5b8cff;
+
+  /* Text/brand gradient — lives on the dark ground, AA-clear there. */
+  --site-grad: linear-gradient(100deg, #8b5cf6 0%, #5b8cff 100%);
+  /* Button gradient — for CONTROLS, where white sits on the fill and every
+     stop must clear 4.5:1. The brighter --site-grad fails there (4.23 /
+     3.16); this pair's worst point is 5.17. Don't use --site-grad on a
+     button. The brand mark (.brand__glyph) does carry white on --site-grad
+     at 3.74:1 — that is a logotype, exempt under 1.4.3, and deliberate. */
+  --site-grad-btn: linear-gradient(100deg, #7c3aed 0%, #2563eb 100%);
+}
+
+/* ============================================================
+   Starlight brand overrides — DARK ONLY.
+
+   This block used to also match a bare `:root`. Starlight ships its theme
+   in a cascade layer and unlayered rules beat layered ones regardless of
+   specificity, so the bare selector forced these dark values even under
+   data-theme='light' — while every token NOT listed here (the aside tints,
+   for one) stayed light. Result: light-mode asides rendered #eef0f7 on
+   #fceac5, i.e. 1.04:1, on 13 of 20 pages, reachable by nothing more than
+   an OS light preference. Half-committing to dark was worse than either
+   choice. Scoped to dark; light mode now gets Starlight's own coherent
+   light theme.
+   ============================================================ */
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #1b2030;
+  --sl-color-accent: var(--uh-accent);
+  --sl-color-accent-high: var(--uh-accent2);
+
+  --sl-color-white: var(--uh-txt);
+  --sl-color-gray-1: #d7dbe8;
+  --sl-color-gray-2: var(--uh-txt2);
+  --sl-color-gray-3: var(--uh-txt3);
+  --sl-color-gray-4: #3a4259;
+  --sl-color-gray-5: var(--uh-bg3);
+  --sl-color-gray-6: var(--uh-bg1);
+  --sl-color-black: var(--uh-desk);
+
+  --sl-color-bg: var(--uh-desk);
+  --sl-color-bg-nav: rgba(16, 19, 28, 0.6);
+  --sl-color-bg-sidebar: var(--uh-bg0);
+  --sl-color-hairline: var(--uh-line);
+  --sl-color-hairline-light: var(--uh-line);
+  --sl-color-hairline-shade: var(--uh-line2);
+
+  --sl-color-text: var(--uh-txt);
+  --sl-color-text-accent: var(--uh-accent2);
+
+  --sl-font: var(--uh-font-ui);
+  --sl-font-mono: var(--uh-font-mono);
+}
+
+/* Starlight paints its own ground per mode; the landing overrides this in
+   landing.css. Hard-coding the dark desk here re-broke light mode. */
+:root[data-theme='dark'] html,
+:root[data-theme='dark'] body {
+  background-color: var(--uh-desk);
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--uh-font-mono);
+}
+
+.sl-link-card,
+.card {
+  transition: border-color 0.12s ease;
+}
+
+:where(a, button, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--uh-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

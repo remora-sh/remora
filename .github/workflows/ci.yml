@@ -1,0 +1,128 @@
+name: CI
+
+# Path-filtered so a website-only or docs-only commit does not compile Rust.
+# Two things this filter must NOT quietly break, hence the duplication below:
+#   * tag pushes — GitHub does not evaluate `paths` for them, so releases are
+#     unaffected (this workflow has no tag trigger anyway);
+#   * `schedule` — `paths` never applies to cron, so the weekly cargo-deny
+#     advisory sweep keeps running whether or not anything changed.
+# GitHub Actions does not support YAML anchors, so push/pull_request repeat the
+# list verbatim — keep the two copies in sync.
+on:
+  push:
+    branches: [main, "fix/**"]
+    paths:
+      - "rust-core/**"
+      - "server/**"
+      # Both are excluded from the root workspace, but the `deny` job gates
+      # their lockfiles because they ship to users (client binary, admin wasm).
+      - "client/src-tauri/**"
+      - "server-ui/crypto-wasm/**"
+      # Not Rust, but the log-redaction guard scans client/src for .ts/.tsx —
+      # dropping this would silently stop policing the frontend's log calls.
+      - "client/src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "deny.toml"
+      - "scripts/check-log-redaction.py"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "server/**"
+      - "client/src-tauri/**"
+      - "server-ui/crypto-wasm/**"
+      - "client/src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "deny.toml"
+      - "scripts/check-log-redaction.py"
+      - ".github/workflows/ci.yml"
+  schedule:
+    - cron: "0 6 * * 1" # weekly — surfaces new advisories via cargo-deny
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Toolchain (channel 1.95 + rustfmt/clippy) comes from rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build deps (OpenSSL + C toolchain for bundled-sqlcipher)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev clang
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --features unissh-automation/core -- -D warnings
+      # Logs must carry metadata only — fail if a log/print call interpolates a
+      # secret-bearing value (see SECURITY.md "Logging and redaction").
+      - name: Log redaction guard
+        run: python3 scripts/check-log-redaction.py
+
+  test:
+    name: test (linux · root container · sshd)
+    runs-on: ubuntu-latest
+    # The sshd-backed integration tests are designed to run as root in an
+    # isolated container (they log in as `root` against a self-spawned sshd).
+    # The container also gives us a privileged, reproducible env for the full
+    # `cargo test --workspace` (core crates + unissh-server).
+    container: rust:bookworm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install sshd + OpenSSL headers + C toolchain (bundled-sqlcipher)
+        run: |
+          apt-get update
+          apt-get install -y \
+            openssh-server openssh-client \
+            pkg-config libssl-dev clang
+      - uses: Swatinem/rust-cache@v2
+      # rust:bookworm ships a recent stable toolchain; rust-toolchain.toml (1.95)
+      # is honored by cargo via rustup inside the image.
+      - run: cargo test --workspace --features unissh-automation/core
+
+  mcp-platform:
+    name: MCP loopback (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # Pure adapter tests need neither a display nor SSH credentials. They cover
+      # real loopback sockets, native digest persistence, guards and SDK logging.
+      - run: cargo test -p unissh-mcp
+
+  deny:
+    name: cargo-deny (supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Root workspace (core crates + unissh-server). Reads deny.toml from root.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses
+      # The shipped desktop/mobile client is its OWN workspace (excluded from the
+      # root), so the root gate above never sees its lockfile — gate it too, since
+      # it is the binary users install. advisories+sources only (default policy).
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: client/src-tauri/Cargo.toml
+          command: check advisories sources
+      # The admin-panel wasm crypto (keyset unlock / challenge signing / registration)
+      # is also a standalone workspace and runs in users' browsers — gate it too.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: server-ui/crypto-wasm/Cargo.toml
+          command: check advisories sources

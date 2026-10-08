@@ -1,0 +1,915 @@
+/* ============================================================
+   UniSSH landing page.
+   Builds on the tokens in theme.css. Standalone full-page layout —
+   NOT the Starlight doc shell.
+
+   Mobile-first: the unprefixed rule is the phone rule; wider screens
+   are the exception. The app window has two renderings rather than
+   one scaled-down one — see .uapp--desk / .uapp--phone in AppWindow.
+   ============================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+html,
+body {
+  max-width: 100%;
+  /* clip, not hidden. `overflow-x: hidden` forces overflow-y to compute to
+     `auto`, turning BOTH html and body into vertical scroll containers. The
+     1500px .sky makes body ~14px taller than its content, so a wheel gesture
+     was consumed scrolling body those few pixels before the page (html)
+     moved — you had to scroll twice. `overflow-x: clip` leaves overflow-y as
+     `clip` (not a scroll container), so the viewport is the only scroller,
+     while horizontal overflow is still clipped. */
+  overflow-x: clip;
+}
+
+body {
+  margin: 0;
+  background: var(--site-ground);
+  color: var(--site-ink);
+  font-family: var(--uh-font-ui);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  position: relative;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+p {
+  margin: 0;
+}
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+:where(a, button, input, summary):focus-visible {
+  outline: 2px solid var(--site-violet-lite);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* Visually hidden, still in the a11y tree and still focusable. For headings
+   that a sighted reader gets from layout but a screen reader needs spoken. */
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 12px 18px;
+  border-radius: 0 0 10px 0;
+  background: var(--site-violet);
+  color: #fff;
+  font-weight: 600;
+}
+.skip-link:focus {
+  left: 0;
+}
+
+.wrap {
+  width: 100%;
+  max-width: 1240px;
+  margin-inline: auto;
+  padding-inline: 20px;
+}
+
+/* ============================================================
+   The sky — nebula washes, a deterministic starfield and the
+   planet horizon.
+
+   ABSOLUTE, not fixed, and deliberately finite. It used to be
+   `position: fixed` "so it parallaxes for free" — which meant the arc's
+   bright core sat in a permanent viewport band that every scrolled
+   element crossed. Measured against real composited pixels, that put 43
+   text samples under AA (worst 2.90:1): .feature p, .crate, .claim__desc,
+   .download__note, the footer. The tokens' own "7.96:1 on ground"
+   comments were true and irrelevant — the ground is not what the text
+   sat on. The sky now ends with the hero, and everything below it is on
+   flat --site-ground, which is what those numbers describe.
+   ============================================================ */
+.sky {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1500px;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  /* no hard edge where it stops */
+  mask-image: linear-gradient(#000 72%, transparent 99%);
+  -webkit-mask-image: linear-gradient(#000 72%, transparent 99%);
+}
+.sky__stars {
+  position: absolute;
+  inset: 0;
+}
+.sky__stars i {
+  position: absolute;
+  border-radius: 50%;
+  background: #fff;
+}
+.sky__neb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+}
+.sky__neb--violet {
+  left: -10%;
+  top: -18%;
+  width: 70%;
+  height: 65%;
+  background: radial-gradient(circle, rgba(124, 58, 237, 0.34) 0%, rgba(124, 58, 237, 0) 70%);
+}
+.sky__neb--indigo {
+  right: -14%;
+  top: 6%;
+  width: 62%;
+  height: 60%;
+  background: radial-gradient(circle, rgba(59, 84, 220, 0.3) 0%, rgba(59, 84, 220, 0) 70%);
+}
+.sky__neb--teal {
+  right: -6%;
+  top: 48%;
+  width: 44%;
+  height: 44%;
+  background: radial-gradient(circle, rgba(45, 212, 191, 0.2) 0%, rgba(45, 212, 191, 0) 70%);
+}
+.sky__arc,
+.sky__arc-glow {
+  position: absolute;
+  left: 50%;
+  top: 52%;
+  transform: translateX(-50%);
+  width: 260%;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+}
+.sky__arc {
+  background: radial-gradient(
+    circle,
+    rgba(7, 9, 17, 0) 69.2%,
+    rgba(167, 139, 250, 0.55) 69.9%,
+    rgba(139, 92, 246, 0.1) 70.6%,
+    rgba(7, 9, 17, 0) 72%
+  );
+}
+.sky__arc-glow {
+  background: radial-gradient(
+    circle,
+    rgba(7, 9, 17, 0) 66%,
+    rgba(124, 58, 237, 0.3) 70%,
+    rgba(7, 9, 17, 0) 75%
+  );
+  filter: blur(26px);
+}
+
+.page {
+  position: relative;
+  z-index: 1;
+}
+
+/* ============================================================
+   Buttons
+   ============================================================ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-family: var(--uh-font-ui);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 14px 22px;
+  min-height: 44px; /* WCAG 2.5.5 — the same floor the app uses (SIZE.tapMin) */
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-primary {
+  background: var(--site-grad-btn);
+  color: #fff;
+  box-shadow: 0 10px 30px -10px rgba(124, 58, 237, 0.75);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--site-ink);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+.btn-lg {
+  font-size: 16px;
+  padding: 15px 28px;
+}
+
+/* ============================================================
+   Topbar
+   ============================================================ */
+.site-header {
+  padding: 16px 16px 0;
+}
+.site-header__inner {
+  max-width: 1240px;
+  margin-inline: auto;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 11px 12px 11px 16px;
+  border: 1px solid var(--uh-line);
+  border-radius: 20px;
+  background: rgba(14, 17, 29, 0.55);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex: none;
+  min-height: 44px;
+}
+.brand__glyph {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: var(--site-grad);
+  display: grid;
+  place-items: center;
+  font-family: var(--uh-font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  letter-spacing: -0.05em;
+  box-shadow: 0 6px 18px -6px rgba(124, 58, 237, 0.8);
+}
+.brand__name {
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.site-nav {
+  display: none;
+}
+.site-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+}
+.gh-link {
+  display: none;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  color: var(--site-ink2);
+}
+.gh-link:hover {
+  color: var(--site-ink);
+}
+.burger {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 11px;
+  background: transparent;
+  color: var(--site-ink);
+}
+@media (min-width: 1080px) {
+  .site-nav {
+    display: flex;
+    gap: 30px;
+    font-size: 15px;
+    color: var(--site-ink2);
+  }
+  .site-nav a:hover {
+    color: var(--site-ink);
+  }
+  .gh-link {
+    display: flex;
+  }
+  .burger {
+    display: none;
+  }
+}
+
+/* ============================================================
+   Hero
+   ============================================================ */
+.hero {
+  text-align: center;
+  padding: 64px 20px 0;
+}
+@media (min-width: 1080px) {
+  .hero {
+    padding: 58px 20px 0;
+  }
+}
+.hero h1 {
+  font-size: clamp(30px, 4.4vw, 52px);
+  font-weight: 700;
+  max-width: 15ch;
+  margin-inline: auto;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  text-wrap: pretty;
+}
+@media (min-width: 1080px) {
+  .hero h1 {
+    max-width: 780px;
+  }
+}
+.grad-text {
+  background: var(--site-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.hero__subhead {
+  margin: 22px auto 0;
+  max-width: 46ch;
+  font-size: clamp(15px, 1.35vw, 18px);
+  color: var(--site-ink2);
+}
+.hero__cta {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  margin-top: 30px;
+  flex-wrap: wrap;
+}
+.hero__meta {
+  display: flex;
+  gap: 14px 34px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 30px;
+  font-size: 15px;
+  color: var(--site-ink2);
+}
+.hero__meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+.hero__meta svg {
+  color: var(--site-violet-lite);
+  flex: none;
+}
+
+/* ============================================================
+   Stage — the app window flanked by feature rails
+   ============================================================ */
+.stage {
+  max-width: 1400px;
+  margin: 56px auto 0;
+  padding: 0 20px 90px;
+  display: grid;
+  gap: 34px;
+}
+@media (min-width: 1180px) {
+  .stage {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr) minmax(0, 200px);
+    gap: 32px;
+    align-items: start;
+    margin-top: 46px;
+  }
+}
+/* .appwrap MUST keep min-width:0 — it is a grid item, and without it the
+   automatic minimum size lets the phone shell push the track past the
+   viewport (body's overflow-x:hidden then silently hides the damage). */
+.appwrap {
+  min-width: 0;
+}
+.feats {
+  display: grid;
+  gap: 34px;
+  align-content: start;
+}
+@media (max-width: 1179px) {
+  .feats {
+    grid-template-columns: 1fr;
+  }
+  /* the product shot is the payoff — it leads once the columns collapse */
+  .appwrap {
+    order: 1;
+  }
+  .feats--l {
+    order: 2;
+  }
+  .feats--r {
+    order: 3;
+  }
+}
+@media (min-width: 640px) and (max-width: 1179px) {
+  .feats {
+    grid-template-columns: 1fr 1fr;
+    gap: 28px;
+  }
+}
+@media (min-width: 1180px) {
+  .feats {
+    padding-top: 78px;
+  }
+}
+.feat__icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: rgba(139, 92, 246, 0.12);
+  border: 1px solid rgba(139, 92, 246, 0.22);
+  color: var(--site-violet-lite);
+  margin-bottom: 14px;
+}
+.feat h3 {
+  font-size: 19px;
+  font-weight: 600;
+  margin-bottom: 9px;
+}
+.feat h3 em {
+  font-style: normal;
+  color: var(--site-violet-lite);
+}
+.feat p {
+  font-size: 15px;
+  color: var(--site-ink3);
+  line-height: 1.55;
+}
+
+/* ============================================================
+   Sections
+   ============================================================ */
+.section {
+  padding: 20px 0 90px;
+}
+.section-head {
+  max-width: 640px;
+  margin: 0 auto 44px;
+  text-align: center;
+}
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--uh-font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--site-ink3);
+}
+.eyebrow i {
+  font-style: normal;
+  color: var(--site-violet-lite);
+}
+.section-head h2 {
+  font-size: clamp(26px, 3.4vw, 40px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-top: 12px;
+}
+/* Inside a panel the head is already positioned by the panel — it only needs
+   its h2 rule, not the centring and the 44px gap. */
+.section-head--flush {
+  margin: 0 0 4px;
+  max-width: 680px;
+  text-align: left;
+}
+.section-head p {
+  margin-top: 16px;
+  color: var(--site-ink2);
+  font-size: clamp(15px, 1.4vw, 17px);
+}
+
+.panel {
+  /* opaque: a translucent panel over the sky was a second way the arc
+     reached body text */
+  background: var(--uh-bg0);
+  border: 1px solid var(--uh-line);
+  border-radius: 16px;
+  padding: 26px 22px;
+}
+@media (min-width: 760px) {
+  .panel {
+    padding: 34px 32px;
+  }
+}
+
+/* Trust pillars */
+.trust__lead {
+  font-size: clamp(20px, 2.6vw, 30px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  max-width: 24ch;
+  margin: 14px 0 26px;
+}
+.trust__pillars {
+  display: grid;
+  gap: 26px;
+}
+@media (min-width: 860px) {
+  .trust__pillars {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 32px;
+  }
+}
+.pillar__n {
+  font-family: var(--uh-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--site-violet-lite);
+  margin-bottom: 10px;
+}
+.pillar h3 {
+  font-size: 17px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.pillar p {
+  font-size: 14.5px;
+  color: var(--site-ink3);
+  line-height: 1.6;
+}
+
+/* Feature grid */
+.feature-grid {
+  display: grid;
+  gap: 14px;
+}
+@media (min-width: 700px) {
+  .feature-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (min-width: 1080px) {
+  .feature-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+}
+.feature {
+  position: relative;
+  border: 1px solid var(--uh-line);
+  border-radius: 12px;
+  background: var(--uh-bg0);
+  padding: 22px 20px 20px;
+}
+.feature::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 20px;
+  width: 24px;
+  height: 2px;
+  background: var(--site-violet-lite);
+  border-radius: 0 0 2px 2px;
+}
+.feature__lbl {
+  font-family: var(--uh-font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  color: var(--site-violet-lite);
+  text-transform: uppercase;
+}
+.feature h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 10px 0 8px;
+}
+.feature p {
+  font-size: 14px;
+  color: var(--site-ink3);
+  line-height: 1.6;
+}
+
+/* Security claims */
+.security__claims {
+  display: grid;
+  gap: 16px;
+  margin-top: 26px;
+}
+@media (min-width: 760px) {
+  .security__claims {
+    grid-template-columns: 1fr 1fr;
+    gap: 18px 32px;
+  }
+}
+.claim {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+}
+.claim__icon {
+  color: var(--uh-green);
+  flex: none;
+  margin-top: 2px;
+}
+.claim__title {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+.claim__desc {
+  font-size: 13.5px;
+  color: var(--site-ink3);
+  margin-top: 2px;
+  line-height: 1.55;
+}
+.security__foot {
+  margin-top: 26px;
+  padding-top: 20px;
+  border-top: 1px solid var(--uh-line);
+  font-size: 14px;
+  color: var(--site-ink3);
+}
+.security__foot a {
+  color: var(--site-violet-lite);
+  font-weight: 600;
+}
+.security__foot a:hover {
+  text-decoration: underline;
+}
+
+/* Code panels */
+.code-grid {
+  display: grid;
+  gap: 14px;
+}
+@media (min-width: 960px) {
+  .code-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+}
+.code-panel {
+  border: 1px solid var(--uh-line);
+  border-radius: 12px;
+  background: var(--uh-bg0);
+  overflow: hidden;
+  min-width: 0;
+}
+.code-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--uh-line);
+  background: var(--uh-bg1);
+}
+.code-panel__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--uh-font-mono);
+  font-size: 12px;
+  color: var(--site-ink2);
+}
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--uh-font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--site-ink3);
+  background: transparent;
+  border: 1px solid var(--uh-line);
+  border-radius: 7px;
+  padding: 5px 9px;
+  cursor: pointer;
+  min-height: 44px; /* WCAG 2.5.5 — it is a real button, not inline text */
+}
+.copy-btn:hover {
+  color: var(--site-ink);
+  border-color: var(--uh-line2);
+}
+.code-panel__body {
+  margin: 0;
+  padding: 14px;
+  overflow-x: auto;
+  font-family: var(--uh-font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--site-ink2);
+}
+.code-panel__body code {
+  font-size: inherit;
+}
+.code-show__caption {
+  margin-top: 22px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--site-ink3);
+}
+
+/* Architecture */
+.arch-grid {
+  display: grid;
+  gap: 14px;
+}
+@media (min-width: 860px) {
+  .arch-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+}
+.arch-node {
+  border: 1px solid var(--uh-line);
+  border-radius: 12px;
+  background: var(--uh-bg0);
+  padding: 18px;
+}
+.arch-node__icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgba(139, 92, 246, 0.12);
+  border: 1px solid rgba(139, 92, 246, 0.22);
+  color: var(--site-violet-lite);
+  margin-bottom: 12px;
+}
+.arch-node__name {
+  font-family: var(--uh-font-mono);
+  font-size: 14px;
+  font-weight: 600;
+}
+.arch-node__role {
+  font-size: 13px;
+  color: var(--site-ink3);
+  margin-top: 4px;
+}
+.arch-node__dep {
+  font-family: var(--uh-font-mono);
+  font-size: 11px;
+  color: var(--site-ink3);
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--uh-line);
+}
+.crates-head {
+  margin-top: 28px;
+  font-family: var(--uh-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--site-ink3);
+}
+.crates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 12px;
+}
+.crate {
+  font-family: var(--uh-font-mono);
+  font-size: 11.5px;
+  color: var(--site-ink3);
+  border: 1px solid var(--uh-line);
+  border-radius: 999px;
+  padding: 4px 11px;
+}
+.arch__foot {
+  margin-top: 24px;
+  font-size: 14px;
+  color: var(--site-ink3);
+}
+.arch__foot a {
+  color: var(--site-violet-lite);
+  font-weight: 600;
+}
+.arch__foot a:hover {
+  text-decoration: underline;
+}
+
+/* Download CTA */
+.download {
+  text-align: center;
+  padding: 20px 0 90px;
+}
+.download h2 {
+  font-size: clamp(26px, 3.4vw, 40px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin: 12px auto 16px;
+  max-width: 18ch;
+}
+.download p {
+  color: var(--site-ink2);
+  max-width: 54ch;
+  margin-inline: auto;
+  font-size: clamp(15px, 1.4vw, 17px);
+}
+.download__cta {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  margin-top: 30px;
+  flex-wrap: wrap;
+}
+.download__note {
+  margin-top: 24px;
+  font-family: var(--uh-font-mono);
+  font-size: 11.5px;
+  color: var(--site-ink3);
+  letter-spacing: 0.04em;
+  line-height: 1.9;
+}
+
+/* Footer */
+.site-footer {
+  border-top: 1px solid var(--uh-line);
+  padding: 46px 0 40px;
+}
+.footer__top {
+  display: grid;
+  gap: 32px;
+}
+@media (min-width: 760px) {
+  .footer__top {
+    grid-template-columns: 1.4fr repeat(3, 1fr);
+    gap: 28px;
+  }
+}
+.footer__brand p {
+  margin-top: 14px;
+  font-size: 14px;
+  color: var(--site-ink3);
+  max-width: 30ch;
+}
+.footer__col h3 {
+  font-family: var(--uh-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--site-ink3);
+  margin-bottom: 14px;
+}
+.footer__col ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.footer__col a {
+  font-size: 14px;
+  color: var(--site-ink2);
+}
+.footer__col a:hover {
+  color: var(--site-ink);
+}
+.footer__bottom {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 40px;
+  padding-top: 22px;
+  border-top: 1px solid var(--uh-line);
+  font-family: var(--uh-font-mono);
+  font-size: 11.5px;
+  color: var(--site-ink3);
+  letter-spacing: 0.04em;
+}

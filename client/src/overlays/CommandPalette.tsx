@@ -1,0 +1,480 @@
+// command-palette.tsx — ⌘K live search across hosts, commands, navigation.
+// Pixel-perfect port of command-palette.jsx, wired to the real store + ctx.
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { usePalette } from "@/theme/ThemeProvider";
+import { MONO, rem, TEXT, UI } from "@/theme/tokens";
+import { Icon, NO_AUTOCORRECT, type IconName } from "@/components/primitives";
+import { paneProfile, useApp, type Route } from "@/store/app";
+import { useCtx } from "@/store/ctx";
+import { apiErrorMessage, type ConnectionProfile } from "@/bridge/types";
+import * as api from "@/bridge/api";
+import { toast } from "@/store/toast";
+import { useTranslation, tDyn } from "@/i18n";
+import {
+  builtinsFromProfile,
+  parseParams,
+  planSnippet,
+  resolveCommand,
+  type BuiltinValues,
+} from "@/support/snippetParams";
+import { SnippetParamsForm } from "@/overlays/SnippetParamsForm";
+
+import { isDesktopOs } from "@/bridge/platform";
+
+interface NavCmd {
+  id: string;
+  icon: IconName;
+  labelKey: string;
+  subKey: string;
+  route: Route;
+}
+interface ActionCmd {
+  id: string;
+  icon: IconName;
+  labelKey: string;
+  subKey: string;
+  action: "newhost" | "newkey" | "newtunnel" | "import" | "groups" | "sync" | "lock" | "local";
+}
+
+const CMD_NAV: NavCmd[] = [
+  { id: "n-mcp", icon: "link", labelKey: "mcp.tab", subKey: "mcp.description", route: "mcp" },
+  { id: "n-hosts", icon: "server", labelKey: "nav.allHosts", subKey: "command.nav.hosts", route: "hosts" },
+  { id: "n-terminal", icon: "terminal", labelKey: "nav.terminals", subKey: "command.nav.terminal", route: "terminal" },
+  { id: "n-sftp", icon: "folders", labelKey: "nav.sftp", subKey: "command.nav.sftp", route: "sftp" },
+  { id: "n-broadcast", icon: "radio", labelKey: "nav.broadcast", subKey: "command.nav.broadcast", route: "broadcast" },
+  { id: "n-fleet", icon: "layers", labelKey: "nav.fleetExec", subKey: "command.nav.fleet", route: "fleet" },
+  { id: "n-tunnels", icon: "branch", labelKey: "nav.tunnels", subKey: "command.nav.tunnels", route: "tunnels" },
+  { id: "n-known", icon: "shieldcheck", labelKey: "nav.known", subKey: "command.nav.known", route: "known" },
+  { id: "n-recordings", icon: "record", labelKey: "nav.recordings", subKey: "command.nav.recordings", route: "recordings" },
+  { id: "n-snippets", icon: "terminal", labelKey: "nav.snippets", subKey: "command.nav.snippets", route: "snippets" },
+  { id: "n-keys", icon: "key", labelKey: "nav.keys", subKey: "command.nav.keys", route: "keys" },
+  { id: "n-passwords", icon: "lock", labelKey: "nav.passwords", subKey: "command.nav.passwords", route: "passwords" },
+  { id: "n-identities", icon: "fingerprint", labelKey: "nav.identities", subKey: "command.nav.identities", route: "identities" },
+  { id: "n-notes", icon: "note", labelKey: "nav.notes", subKey: "command.nav.notes", route: "notes" },
+  { id: "n-settings", icon: "sliders", labelKey: "nav.settings", subKey: "command.nav.settings", route: "settings" },
+];
+const CMD_ACTIONS: ActionCmd[] = [
+  // First, and an action rather than a host: it opens a session like picking a
+  // host does, but it is not one, and the Hosts group is where a name means
+  // "somewhere else". Same strings as the "+" picker, so the same thing is
+  // called the same thing in both places.
+  { id: "a-local", icon: "laptop", labelKey: "terminal.localShell", subKey: "terminal.localShellHint", action: "local" },
+  { id: "a-newhost", icon: "plus", labelKey: "command.action.newHost", subKey: "command.action.newHostSub", action: "newhost" },
+  { id: "a-newkey", icon: "key", labelKey: "command.action.newKey", subKey: "command.action.newKeySub", action: "newkey" },
+  { id: "a-newtunnel", icon: "branch", labelKey: "command.action.newTunnel", subKey: "command.action.newTunnelSub", action: "newtunnel" },
+  { id: "a-import", icon: "download", labelKey: "command.action.import", subKey: "command.action.importSub", action: "import" },
+  { id: "a-groups", icon: "layers", labelKey: "command.action.groups", subKey: "command.action.groupsSub", action: "groups" },
+  { id: "a-sync", icon: "refresh", labelKey: "command.action.sync", subKey: "command.action.syncSub", action: "sync" },
+  { id: "a-lock", icon: "lock", labelKey: "command.action.lock", subKey: "command.action.lockSub", action: "lock" },
+];
+
+type FlatItem =
+  | { id: string; icon: IconName; label: string; sub: string; kind: "host"; host: ConnectionProfile }
+  | { id: string; icon: IconName; label: string; sub: string; kind: "nav"; route: Route }
+  | { id: string; icon: IconName; label: string; sub: string; kind: "action"; action: ActionCmd["action"] }
+  | { id: string; icon: IconName; label: string; sub: string; kind: "snippet"; command: string; hasParams: boolean };
+
+/** A parameterised snippet waiting on its form. The pane is pinned when the
+ *  snippet is picked, so the values land where the user was looking then. */
+interface PendingSnippet {
+  label: string;
+  command: string;
+  sessionId: string;
+  builtins: BuiltinValues;
+}
+
+/** Typed into the pane, not executed for the user: the text lands at the
+ *  prompt exactly as if they had pasted it, and pressing Enter stays their
+ *  decision. A snippet that ran itself on selection would make a mis-click
+ *  destructive. */
+function typeIntoPane(sessionId: string, text: string) {
+  void api
+    .sessionWrite(sessionId, Array.from(new TextEncoder().encode(text)))
+    .catch((e) => toast(apiErrorMessage(e), "err"));
+}
+
+interface Group {
+  title: string;
+  items: FlatItem[];
+}
+
+export function CommandPalette() {
+  const { t } = useTranslation();
+  const p = usePalette();
+  const ctx = useCtx();
+  const open = useApp((s) => s.palette);
+  const setPalette = useApp((s) => s.setPalette);
+  const hosts = useApp((s) => s.hosts);
+  const vaultId = useApp((s) => s.vaultId);
+  const device = useApp((s) => s.device);
+
+  // Loaded when the palette opens rather than kept in the store: the library is
+  // small, and reading it on demand means a snippet saved on another device
+  // shows up after a sync without anything having to invalidate a cache.
+  const [snippets, setSnippets] = useState<api.Snippet[]>([]);
+  useEffect(() => {
+    if (!open || !vaultId) return;
+    let cancelled = false;
+    void api
+      .listSnippets(vaultId)
+      .then((list) => {
+        if (!cancelled) setSnippets(list);
+      })
+      .catch(() => {
+        // A palette that still finds hosts is better than one that fails to open.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, vaultId]);
+
+  const [pending, setPending] = useState<PendingSnippet | null>(null);
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState(0);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  const ql = q.trim().toLowerCase();
+
+  const groups = useMemo<Group[]>(() => {
+    const match = (s: string) => !ql || s.toLowerCase().includes(ql);
+
+    const hostItems: FlatItem[] = hosts
+      .filter((h) => match(h.label) || match(h.host) || match(h.user) || h.tags.some(match))
+      .slice(0, 6)
+      .map((h) => ({
+        id: "h-" + h.profileId,
+        icon: "server",
+        label: h.label,
+        sub: `${h.user}@${h.host}`,
+        kind: "host",
+        host: h,
+      }));
+    const navItems: FlatItem[] = CMD_NAV.filter(c => c.route !== "mcp" || (isDesktopOs() && device !== "mobile")).map((c) => ({
+      id: c.id,
+      icon: c.icon,
+      label: tDyn(c.labelKey),
+      sub: tDyn(c.subKey),
+      kind: "nav" as const,
+      route: c.route,
+    })).filter((c) => match(c.label) || match(c.sub));
+    const actItems: FlatItem[] = CMD_ACTIONS
+      // The local terminal is desktop-only, and the palette is one of the few
+      // surfaces the phone shell shares — so it is filtered here rather than
+      // relying on the entry simply failing if tapped.
+      .filter((c) => c.action !== "local" || device !== "mobile")
+      .map((c) => ({
+        id: c.id,
+        icon: c.icon,
+        label: tDyn(c.labelKey),
+        sub: tDyn(c.subKey),
+        kind: "action" as const,
+        action: c.action,
+      }))
+      .filter((c) => match(c.label) || match(c.sub));
+
+    const snippetItems: FlatItem[] = snippets
+      .filter((sn) => match(sn.label) || match(sn.command) || sn.tags.some(match))
+      .slice(0, 6)
+      .map((sn) => ({
+        id: "s-" + sn.snippetId,
+        icon: "terminal" as IconName,
+        label: sn.label,
+        // The command itself is the subtitle: a snippet is chosen by recognising
+        // what it runs, and hiding that behind a name makes the list a guess.
+        sub: sn.command.split("\n")[0],
+        kind: "snippet" as const,
+        command: sn.command,
+        hasParams: parseParams(sn.command).length > 0,
+      }));
+
+    return [
+      { title: t("command.group.hosts"), items: hostItems },
+      { title: t("command.group.snippets"), items: snippetItems },
+      { title: t("command.group.actions"), items: actItems },
+      { title: t("command.group.go"), items: navItems },
+    ].filter((g) => g.items.length);
+  }, [ql, hosts, snippets, device, t]);
+
+  const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
+
+  useEffect(() => {
+    setSel(0);
+  }, [q]);
+
+  let form: React.ReactNode = null;
+  if (pending) {
+    const { ask, fromHost } = planSnippet(pending.command, pending.builtins);
+    form = (
+      <SnippetParamsForm
+        label={pending.label}
+        ask={ask}
+        fromHost={fromHost}
+        onCancel={() => setPending(null)}
+        onSubmit={(values) => {
+          setPending(null);
+          typeIntoPane(pending.sessionId, resolveCommand(pending.command, values, pending.builtins));
+        }}
+      />
+    );
+  }
+
+  if (!open) return form;
+
+  const close = () => setPalette(false);
+
+  const run = (it: FlatItem) => {
+    if (it.kind === "host") {
+      setPalette(false);
+      ctx.connect(it.host);
+    } else if (it.kind === "snippet") {
+      setPalette(false);
+      const st = useApp.getState();
+      const tab = st.terminals.find((x) => x.id === st.activeTermId);
+      const pane = tab?.panes.find((x) => x.id === tab.activePaneId);
+      if (!pane?.sessionId) {
+        toast(t("command.snippetNoPane"), "warn");
+        return;
+      }
+      // Built-ins come from the pane's host; a local shell has none, so there
+      // they are asked like any other parameter. With nothing left to ask there
+      // is no form: the command (escapes resolved, built-ins filled in) goes
+      // straight into the pane — for a plain command, byte for byte.
+      const builtins = builtinsFromProfile(paneProfile(pane));
+      const { ready } = planSnippet(it.command, builtins);
+      if (ready !== null) {
+        typeIntoPane(pane.sessionId, ready);
+        return;
+      }
+      setPending({ label: it.label, command: it.command, sessionId: pane.sessionId, builtins });
+    } else if (it.kind === "nav") {
+      setPalette(false);
+      ctx.go(it.route);
+    } else {
+      setPalette(false);
+      if (it.action === "local") ctx.openLocal();
+      else if (it.action === "newhost") ctx.openModal({ kind: "host" });
+      else if (it.action === "newkey") ctx.openModal({ kind: "key" });
+      else if (it.action === "newtunnel") ctx.openModal({ kind: "tunnel" });
+      else if (it.action === "import") ctx.openImport();
+      else if (it.action === "groups") ctx.openGroups();
+      else if (it.action === "sync") void ctx.reloadVault();
+      else if (it.action === "lock") ctx.onLock();
+    }
+  };
+
+  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSel((s) => Math.min(s + 1, flat.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSel((s) => Math.max(s - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (flat[sel]) run(flat[sel]);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  };
+
+  let idx = -1;
+  return (
+    <>
+      {form}
+      <div
+        onClick={close}
+        style={{
+          position: "absolute",
+          inset: 0,
+          zIndex: 300,
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "center",
+          paddingTop: "12vh",
+          background: p.name === "dark" ? "rgba(6,7,11,0.55)" : "rgba(40,44,60,0.35)",
+          backdropFilter: "blur(3px)",
+        }}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            width: rem(600),
+            maxWidth: "90%",
+            maxHeight: "70vh",
+            display: "flex",
+            flexDirection: "column",
+            background: p.bg1,
+            border: `1px solid ${p.line2}`,
+            borderRadius: 16,
+            boxShadow: p.shadow,
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: rem(11),
+              padding: `${rem(14)} ${rem(16)}`,
+              borderBottom: `1px solid ${p.line}`,
+            }}
+          >
+            <Icon name="search" size={18} color={p.txt3} />
+            <input
+              ref={inputRef}
+              {...NO_AUTOCORRECT}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              onKeyDown={onKey}
+              placeholder={t("command.searchPlaceholder")}
+              style={{
+                flex: 1,
+                background: "none",
+                border: "none",
+                outline: "none",
+                color: p.txt,
+                fontSize: TEXT.lead,
+                fontFamily: UI,
+              }}
+            />
+            <span
+              style={{
+                fontFamily: MONO,
+                fontSize: TEXT.micro,
+                padding: `${rem(2)} ${rem(7)}`,
+                borderRadius: 6,
+                background: p.bg3,
+                border: `1px solid ${p.line}`,
+                color: p.txt3,
+              }}
+            >
+              esc
+            </span>
+          </div>
+          <div style={{ flex: 1, overflowY: "auto", padding: rem(8) }}>
+            {flat.length === 0 ? (
+              <div style={{ padding: `${rem(34)} 0`, textAlign: "center", color: p.txt3, fontSize: TEXT.body }}>
+                {t("command.empty", { q })}
+              </div>
+            ) : (
+              groups.map((g) => (
+                <div key={g.title} style={{ marginBottom: rem(6) }}>
+                  <div
+                    style={{
+                      padding: `${rem(6)} ${rem(10)} ${rem(4)}`,
+                      fontSize: TEXT.micro,
+                      fontWeight: 700,
+                      letterSpacing: rem(0.6),
+                      color: p.txt3,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {g.title}
+                  </div>
+                  {g.items.map((it, i) => {
+                    idx++;
+                    const active = idx === sel;
+                    const myIdx = idx;
+                    return (
+                      <div
+                        key={it.id}
+                        onMouseEnter={() => setSel(myIdx)}
+                        onClick={() => run(it)}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: rem(11),
+                          padding: `${rem(9)} ${rem(10)}`,
+                          cursor: "pointer",
+                          borderTop: i === 0 ? undefined : `1px solid ${p.line}`,
+                          boxShadow: active ? `inset 2px 0 0 ${p.accent}` : undefined,
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: rem(30),
+                            height: rem(30),
+                            borderRadius: 8,
+                            background: p.bg2,
+                            border: `1px solid ${p.line}`,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexShrink: 0,
+                          }}
+                        >
+                          <Icon name={it.icon} size={15} color={p.txt2} />
+                        </span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            style={{
+                              fontSize: TEXT.body,
+                              fontWeight: 600,
+                              color: p.txt,
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {it.label}
+                          </div>
+                          <div
+                            style={{
+                              fontFamily: it.kind === "host" ? MONO : UI,
+                              fontSize: TEXT.small,
+                              color: p.txt3,
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {it.sub}
+                          </div>
+                        </div>
+                        {it.kind === "host" && (
+                          <span style={{ fontSize: TEXT.micro, color: p.txt3 }}>↵ {t("command.terminalHint")}</span>
+                        )}
+                        {it.kind === "snippet" && it.hasParams && (
+                          <span style={{ fontSize: TEXT.micro, color: p.txt3, whiteSpace: "nowrap" }}>
+                            <span style={{ fontFamily: MONO }}>{"{ }"}</span> {t("command.snippetParamsHint")}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ))
+            )}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: rem(14),
+              padding: `${rem(9)} ${rem(14)}`,
+              borderTop: `1px solid ${p.line}`,
+              fontSize: TEXT.small,
+              color: p.txt3,
+            }}
+          >
+            <span>
+              <b style={{ color: p.txt2 }}>↑↓</b> {t("command.navHint")}
+            </span>
+            <span>
+              <b style={{ color: p.txt2 }}>↵</b> {t("command.selectHint")}
+            </span>
+            <span>
+              <b style={{ color: p.txt2 }}>esc</b> {t("command.closeHint")}
+            </span>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}

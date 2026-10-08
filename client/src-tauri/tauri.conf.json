@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Remora",
+  "version": "0.1.0",
+  "identifier": "app.remora.client",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "Remora",
+        "label": "main",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 380,
+        "minHeight": 520,
+        "decorations": false,
+        "transparent": false,
+        "backgroundColor": "#08090d",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "plugins": {
+    "fs": {
+      "requireLiteralLeadingDot": false
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU2MEE1ODBENTQ4NDRCOTAKUldTUVM0UlVEVmdLVnMwKzFmRkUxREVYVi9adjNwTDZTUXBTdTVLb28yS2xUSWtVSlFGcHAyM1EK",
+      "endpoints": ["https://github.com/remora-sh/remora/releases/latest/download/latest.json"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Self-hosted SSH client",
+    "longDescription": "Remora — a self-hosted SSH client with encrypted vaults, fleet operations, SFTP, tunnels, and optional web access.",
+    "macOS": {
+      "infoPlist": {
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLName": "Remora deep link",
+            "CFBundleURLSchemes": ["remora"]
+          }
+        ]
+      }
+    },
+    "windows": {
+      "digestAlgorithm": "sha256"
+    },
+    "iOS": {
+      "minimumSystemVersion": "16.0"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+[package]
+name = "unissh-crypto"
+version.workspace = true
+description = "Cryptographic foundation of the UniSSH core: primitives, envelope wrappers, AEAD with associated data, signatures, blob versioning (crypto agility)."
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+# KDF: only the raw key-derivation API is used; salts come from our rand_core
+# below. Default PHC/password-hash features pull in a separate getrandom 0.4
+# backend, which is not configured for the admin panel's wasm target.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# Default symmetric cipher (192-bit nonce, does not depend on AES-NI)
+# Held at 0.10 with the rest of the aligned generation. 0.11 moves to
+# crypto-common 0.2 and a newer RNG generation, which needs separate browser
+# backend configuration. Upgrade the aligned stack together and verify wasm.
+chacha20poly1305 = "0.10"
+# Public-key encryption: HPKE RFC 9180, DHKEM(X25519, HKDF-SHA256).
+# Version 0.12 keeps rand_core 0.6 — the same generation as dalek 2.x/chacha 0.10
+# (0.13 moved to rand_core 0.9 and forks the RNG traits away from the whole stack).
+hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+# Signatures
+# Held at 2.x deliberately, and this is load-bearing rather than laziness. 3.0 takes its
+# `CryptoRng` bound from rand_core 0.9, while `OsRng` here is rand_core 0.6 — the generation
+# `hpke = "0.12"` above pins us to. Taking 3.0 alone fails to compile
+# (`keys.rs`: OsRng does not implement ed25519_dalek::rand_core::CryptoRng); the whole
+# RNG generation has to move together, and hpke is what blocks it.
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+# Hash for the content_digest of the signed object
+sha2 = "0.10"
+# Secret zeroization
+zeroize = { version = "1.8", features = ["derive"] }
+# Constant-time comparison
+subtle = "2.6"
+# Errors
+thiserror = "2"
+# CSPRNG (OsRng) — rand_core 0.6 generation, compatible with dalek/chacha/hpke
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+hex = "0.4"

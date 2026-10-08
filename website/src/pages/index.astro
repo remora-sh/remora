@@ -1,0 +1,153 @@
+---
+import '../styles/theme.css';
+import '../styles/landing.css';
+
+import Icon from '../components/Icon.astro';
+import SiteHeader from '../components/SiteHeader.astro';
+import AppWindow from '../components/AppWindow.astro';
+import FeatureRail from '../components/FeatureRail.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+
+const base = import.meta.env.BASE_URL; // '/' on the unissh.dev custom domain
+const withBase = (p: string) => `${base}${p.replace(/^\//, '')}`;
+
+// Internal doc links (base-aware).
+const overviewHref = withBase('overview/introduction/');
+const installHref = withBase('overview/install/');
+const quickstartHref = withBase('overview/quickstart/');
+const archHref = withBase('architecture/system-overview/');
+const securityHref = withBase('architecture/zero-knowledge-model/');
+const cratesHref = withBase('components/crates/');
+const serverDocHref = withBase('components/server/');
+const deployHref = withBase('operations/deploy/');
+const supportHref = withBase('support/');
+
+// External links.
+const githubHref = 'https://github.com/goduni/unissh';
+const githubReleases = 'https://github.com/goduni/unissh/releases';
+
+const title = 'unissh – a modern and secure, fully open-source SSH client';
+const description =
+  'A modern and secure, fully open-source SSH client that works without a server. End-to-end encrypted vaults, real terminals, SFTP and tunnels – kept local by default, and optionally synced through a server you run yourself, which only ever stores ciphertext.';
+const canonical = `${import.meta.env.SITE ?? ''}${base}`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href={withBase('favicon.svg')} type="image/svg+xml" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#070911" />
+    <link rel="canonical" href={canonical} />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <div class="sky" aria-hidden="true">
+      <div class="sky__neb sky__neb--violet"></div>
+      <div class="sky__neb sky__neb--indigo"></div>
+      <div class="sky__neb sky__neb--teal"></div>
+      <div class="sky__stars" id="stars"></div>
+      <div class="sky__arc-glow"></div>
+      <div class="sky__arc"></div>
+    </div>
+
+    <div class="page">
+      <SiteHeader
+        homeHref={base}
+        docsHref={overviewHref}
+        archHref={archHref}
+        securityHref={securityHref}
+        supportHref={supportHref}
+        ctaHref={githubReleases}
+        githubHref={githubHref}
+      />
+
+      <main id="main">
+        <section class="hero" aria-labelledby="hero-head">
+          <h1 id="hero-head">
+            <span class="grad-text">unissh</span> – a modern and secure, fully open-source SSH
+            client with an optional self-hosted sync server
+          </h1>
+          <p class="hero__subhead">
+            Cross-platform. Secure by default. Works without a server.<br />
+            Designed for developers and teams that demand more.
+          </p>
+          <div class="hero__cta">
+            <a class="btn btn-primary btn-lg" href={githubReleases} rel="noopener">
+              <Icon name="download" size={17} stroke={1.8} /> Download
+            </a>
+            <a class="btn btn-ghost btn-lg" href={overviewHref}>
+              Explore Features <Icon name="arrowright" size={15} stroke={2} />
+            </a>
+          </div>
+          <div class="hero__meta">
+            <span><Icon name="lock" size={16} stroke={1.8} /> End-to-end encrypted</span>
+            <span><Icon name="refresh" size={16} stroke={1.8} /> Optional multi-device sync</span>
+            <span><Icon name="code" size={16} stroke={1.8} /> 100% open-source</span>
+          </div>
+        </section>
+
+        <section class="stage" aria-labelledby="stage-head">
+          <h2 id="stage-head" class="vh">The unissh client</h2>
+          <FeatureRail side="l" />
+          <div class="appwrap"><AppWindow /></div>
+          <FeatureRail side="r" />
+        </section>
+      </main>
+
+      <SiteFooter
+        links={{
+          home: base,
+          overview: overviewHref,
+          quickstart: quickstartHref,
+          install: installHref,
+          arch: archHref,
+          security: securityHref,
+          crates: cratesHref,
+          server: serverDocHref,
+          deploy: deployHref,
+          github: githubHref,
+          githubReleases: githubReleases,
+          support: supportHref,
+        }}
+      />
+    </div>
+
+    <script>
+      // Deterministic starfield: the same sky on every load, and on every
+      // machine. A seeded LCG, not Math.random — a hero that reshuffles
+      // itself between two people looking at it is a bug, not a feature.
+      const host = document.getElementById('stars');
+      if (host) {
+        let seed = 20260716;
+        const rnd = () => {
+          seed = (seed * 1664525 + 1013904223) % 4294967296;
+          return seed / 4294967296;
+        };
+        let html = '';
+        for (let i = 0; i < 110; i++) {
+          const x = (rnd() * 100).toFixed(2);
+          const y = (rnd() * 96).toFixed(2);
+          const o = (0.18 + rnd() * 0.62).toFixed(2);
+          const s = rnd() < 0.15 ? 3 : 2;
+          html += `<i style="left:${x}%;top:${y}%;opacity:${o};width:${s}px;height:${s}px"></i>`;
+        }
+        host.innerHTML = html;
+      }
+    </script>
+  </body>
+</html>

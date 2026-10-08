@@ -1,0 +1,9 @@
+{
+  "name": "@remora/shared-types",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "description": "Shared TypeScript types for Remora web + future shared UI packages"
+}

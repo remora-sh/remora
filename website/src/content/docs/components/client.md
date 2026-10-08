@@ -1,0 +1,78 @@
+---
+title: Desktop & mobile client
+description: The Remora cross-platform client — a Tauri 2 + React app wrapping the Rust core directly, with real terminals, fleet ops, SFTP, and tunnels.
+---
+
+The Remora client is a cross-platform SSH client (macOS / iOS / Linux / Windows / Android) built on **Tauri v2** with a **React 19 + TypeScript** frontend and a **Rust backend** that wraps the existing core (`rust-core`, crate `unissh-ffi`) directly as a path dependency.
+
+The UI is dark-first and premium-technological — Hanken Grotesk + JetBrains Mono, three theme families (**mono** is the default; **nebula** and **barbie** are opt-in), five accent presets, light/dark/auto modes with an AA-verified twin each, **eighteen** terminal themes (five of them light) plus a custom theme editor, a desktop shell and a purpose-built mobile shell.
+
+## Architecture
+
+```
+src/                      React + TS frontend
+  theme/      design tokens, ThemeProvider, keyframes/fonts
+  components/ primitives (Icon + ~60 glyphs, Btn, Tag, AuthBadge, StatusDot, …)
+  shell/      Shell.tsx (title bar, sidebar ↔ icon rail, vault switcher, nav)
+  bridge/     types.ts (DTO mirrors) + api.ts (typed invoke wrappers per command)
+  store/      zustand: route/vault/data/terminals/tunnels/overlays, ctx, toast
+  views/      ViewHosts, ViewTerminal (real xterm.js), ViewRun (mounts ViewFleet
+              and ViewBroadcast as two modes of one screen), ViewSftp, ViewTunnels,
+              ViewKnown, ViewSecrets (SSH keys/agent + passwords/notes), ViewSettings
+  overlays/   Entry (onboarding/kit/unlock), Modals, CommandPalette, ImportPreview, …
+  mobile/     MobileApp.tsx (bottom tabs, push stack, sheets, FAB)
+
+src-tauri/                Rust backend
+  src/lib.rs              Tauri builder, plugins, ~160 command handlers, AppState
+  src/commands.rs         every command wraps the blocking core call in spawn_blocking
+  src/dto.rs              serde DTOs <-> unissh-ffi records/enums
+  src/observers.rs        SessionObserver/Exec/Broadcast/SftpProgress -> tauri::ipc::Channel
+  src/state.rs            registries the core does not keep (sessions/tunnels/sftp/…)
+  src/error.rs            ApiError mirrors FfiError (keeps structured HostKeyMismatch)
+  Cargo.toml              depends on unissh-ffi = { path = "../../rust-core/crates/ffi" }
+```
+
+### How the client talks to the core
+
+- The core's `Core` facade is **synchronous/blocking** (it owns its own tokio runtime). Every Tauri command therefore runs the call on a blocking thread via `spawn_blocking`.
+- Terminal / SFTP / broadcast output streams back over `tauri::ipc::Channel` — the Rust observer forwards the bytes and the frontend feeds them straight into xterm.js.
+- The core hands out `Arc<SshSession|SshTunnel|SftpFfi|…>` and forgets them, so `AppState` owns their lifecycle, keyed by a generated id.
+
+:::tip[The security boundary is respected]
+The UI **never receives plaintext private keys** — only public keys, fingerprints, and session data. Password/note reveal is the only type-gated exception. This mirrors the core's [FFI guarantee](../crates/).
+:::
+
+## Honesty to the core
+
+The design prototype showed some indicators the core cannot back; these were intentionally dropped or made real rather than faked:
+
+- Host "online" / ping / cipher labels are **removed** — a host shows as active only when it has a live terminal session in-app.
+- Clipboard auto-clear is wired to the real platform clipboard.
+- Biometric unlock is opt-in and pending verification on real hardware: Windows Hello on Windows; Touch ID on macOS only in a build you sign yourself with an Apple certificate and the keychain entitlement — the official unsigned release reports it unavailable. The master password always works too. See [the threat model](https://github.com/goduni/unissh/blob/main/THREAT_MODEL.md#biometric-unlock-desktop-touch-id-windows-hello).
+- A per-host **Forward the agent** toggle serves a deliberately narrow agent to the target: one key, a confirmation for every signature, add/remove/lock refused, and never to a jump host. Off by default — see [Connecting to hosts](../../overview/connecting/).
+- **Snippets** and **session recording** (asciicast, exportable) are per host and documented in [Connecting to hosts](../../overview/connecting/).
+- A per-host **System agent** auth kind delegates signing to the operating system's ssh-agent. That is how hardware works: FIDO/U2F tokens, PKCS#11 smart cards, Secure Enclave keys, 1Password and gpg-agent all sign through the agent. For such a host the key lives outside the vault — see [the threat model](https://github.com/goduni/unissh/blob/main/THREAT_MODEL.md).
+
+## Prerequisites
+
+- **Node 20.19+ / 22.12+** and **Rust 1.95+**.
+- The sibling `rust-core/` must be present (consumed as a path dependency).
+- **Linux desktop:** `libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libssl-dev libxdo-dev libayatana-appindicator3-dev`.
+- **iOS:** macOS + Xcode + CocoaPods. **Android:** Android Studio + SDK + NDK.
+
+See [Install & prerequisites](../../overview/install/).
+
+## Develop / build
+
+```bash
+npm install
+npm run tauri dev        # desktop dev (vite + the Rust app)
+npm run build            # typecheck + vite production build (frontend only)
+npm run tauri build      # desktop bundle (.app/.dmg/.deb/.AppImage/.msi)
+
+# mobile (run init once):
+npm run tauri ios init   && npm run tauri ios dev
+npm run tauri android init && npm run tauri android dev
+```
+
+Desktop bundles are produced by CI on every PR/push and attached to GitHub Releases on a version tag — **unsigned by design** (no developer identity is attached). See [CI/CD & releases](../../operations/ci-cd/) for the unsigned-install notes.

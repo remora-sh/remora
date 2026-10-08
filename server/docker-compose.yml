@@ -1,0 +1,52 @@
+# =============================================================================
+# UniSSH Server — DEV variant (single service, NOT for production).
+#
+#   docker compose -f server/docker-compose.yml up --build
+#
+# This is a minimal, single-service developer convenience: it builds ONLY the
+# server and host-publishes :8443 as PLAIN HTTP so you can poke the API locally
+# (e.g. `curl http://localhost:8443/readyz`). There is NO TLS, NO Caddy, and NO
+# SPA here.
+#
+# >>> The PRODUCTION stack is the repo-root `compose.yml` (Caddy + SPA + server,
+#     TLS-terminated, server internal-only). See deploy/README.md. <<<
+#
+# Build context is the REPO ROOT so that BOTH server/ and rust-core/ exist in
+# the context (the server's dev-deps reference ../rust-core at manifest parse
+# time). The old `context: ..` already pointed at the repo root, kept here.
+# =============================================================================
+
+name: unissh-dev
+
+services:
+  unissh-server:
+    build:
+      context: ..                     # repo root: contains server/ + rust-core/
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8443:8443"         # DEV: plain HTTP bound to localhost ONLY for poking
+    environment:
+      # SQLite backend (dev default).
+      UNISSH__DB__BACKEND: "sqlite"
+      UNISSH__DB__URL: "/app/data/unissh.db"
+      # Plain HTTP, no in-process TLS (terminate at a proxy in prod).
+      UNISSH__SERVER__BIND: "0.0.0.0:8443"
+      UNISSH__SERVER__TLS_CERT: ""
+      UNISSH__SERVER__TLS_KEY: ""
+      # DEV: no proxy in front of this single service — do NOT trust X-Forwarded-*.
+      UNISSH__SERVER__TRUST_PROXY: "false"
+      UNISSH__OBS__LOG_FORMAT: "json"
+      # First-run: the server prints a SETUP CODE to its log on first boot; claim
+      # the instance with it:
+      #   docker compose -f server/docker-compose.yml logs unissh-server | grep -i "setup code"
+      # Uncomment to pin a deterministic code for local/dev instead:
+      # UNISSH__SETUP__CODE: "dev-setup-code"
+    volumes:
+      - unissh-data:/app/data         # SQLite file; writable by uid 65532 (distroless nonroot)
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  unissh-data:

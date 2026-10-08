@@ -1,0 +1,418 @@
+---
+/**
+ * The real client, drawn from client/src — not from imagination.
+ *
+ *  desktop (>=1180px) : the Terminal route — native macOS titlebar
+ *    (tauri decorations:true, so the OS draws the lights), the 44px
+ *    in-app toolbar (App.tsx:352-406), the 220px nav with its three
+ *    groups (Shell.tsx:760-899), TermTabStrip (TermTabStrip.tsx:36-345)
+ *    and the 30px status bar (ViewTerminal.tsx:1443-1530).
+ *
+ *  phone (<1180px) : the real mobile shell (mobile/MobileApp.tsx) —
+ *    top bar with the vault pill + SyncBadge, the session switcher,
+ *    the PTY, the 19-key accessory row (KEY_SEQ, :273-293) and the
+ *    four-tab bar (:679-763). NOT the desktop window scaled down.
+ *
+ * Palette: the NEBULA family (tokens.ts DARK + ACCENTS.blue). Note the
+ * app's *default* family is mono — see the note in theme.css.
+ *
+ * Both renderings are role="img" with the whole mock aria-hidden: it is a
+ * picture of the product, not operable chrome. Without the aria-hidden a
+ * screen reader walks the fake transcript and reads all 19 key labels.
+ *
+ * Deliberately absent, because the app has none of them: a right-hand
+ * "Sync" panel (sync state is the SyncBadge in the vault card), a
+ * latency/ping readout (ViewHosts.tsx:4-5), a port on host rows, and
+ * any glow on status dots (StatusDot's `glow` defaults off).
+ */
+---
+
+<!-- ============================================================
+     THE REAL CLIENT — drawn from client/src, not from imagination.
+     Palette: NEBULA dark (tokens.ts DARK + ACCENTS.blue).
+     Desktop = Terminal route: native titlebar · 44px toolbar · 220px nav · tabstrip/xterm/statusbar.
+     Mobile  = the real mobile shell: top bar · session switcher · xterm · 19-key bar · 4 tabs.
+     ============================================================ -->
+
+<!-- ============ DESKTOP (>=1180px) ============ -->
+<div class="uapp uapp--desk" role="img" aria-label="A screenshot of the unissh desktop client on the Terminal screen: a sidebar of hosts and operations, three open sessions, and a live shell running neofetch on prod-web-01.">
+  <!-- native macOS titlebar: tauri decorations:true, the OS draws these -->
+  <div class="uapp__native" aria-hidden="true"><span class="lights"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></span></div>
+
+  <!-- App.tsx:352-406 — 44px in-app toolbar -->
+  <div class="uapp__bar" aria-hidden="true">
+    <span class="ulogo">
+      <i class="ulogo__mark">›_</i><span class="ulogo__wm">Uni<em>SSH</em></span>
+    </span>
+    <span class="uapp__barmid">
+      <span class="usearch">
+        <svg class="i" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>
+        <span class="usearch__t">Search hosts, commands, secrets…</span>
+        <span class="usearch__kbd">⌘K</span>
+      </span>
+    </span>
+    <span class="uapp__barright">
+      <span class="utib"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></span>
+      <span class="utib"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></span>
+      <span class="utib"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+      <span class="uav">g</span>
+    </span>
+  </div>
+
+  <div class="uapp__body" aria-hidden="true">
+    <!-- Shell.tsx:760-899 — 220px sidebar -->
+    <aside class="unav">
+      <div class="unav__grp">Hosts <span class="unav__ga"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></span></div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg><span class="uni__l">All hosts</span><span class="uni__c">12</span></div>
+      <div class="uni uni--sub"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span class="uni__l">edge</span><span class="uni__c">4</span></div>
+      <div class="uni uni--sub"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg><span class="uni__l">db</span><span class="uni__c">3</span></div>
+
+      <div class="unav__grp">Operations</div>
+      <div class="uni is-on"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-5-6-5M12 19h8"/></svg><span class="uni__l">Terminals</span><i class="uni__dot"></i><span class="uni__c">3</span></div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.6 3.9A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2z"/></svg><span class="uni__l">SFTP</span></div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/></svg><span class="uni__l">Run</span></div>
+
+      <div class="unav__grp">Vault &amp; network</div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M17 6l3 3M14 9l3 3"/></svg><span class="uni__l">Secrets</span><span class="uni__c">27</span></div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span class="uni__l">Tunnels</span></div>
+      <div class="uni"><svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg><span class="uni__l">Known hosts</span><span class="uni__c">9</span></div>
+
+      <div class="unav__sp"></div>
+      <!-- Shell.tsx:429-506 — vault switcher; SyncBadge lives HERE, not in a right panel -->
+      <div class="unav__foot">
+        <div class="uvault">
+          <span class="uavx">i</span>
+          <span class="uvault__t">
+            <span class="uvault__l1">infra<svg class="i" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--uh-green);flex:none"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg></span>
+            <span class="uvault__l2">
+              <span class="ubadge"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.3A7 7 0 1 0 5 16h13a4 4 0 0 0 0-8z"/></svg>ops</span>
+              <span class="usync"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>Synced</span>
+            </span>
+          </span>
+          <svg class="uvault__cd" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ViewTerminal.tsx:1332-1533 -->
+    <div class="uterm">
+      <!-- TermTabStrip.tsx:36-345 -->
+      <div class="utabs">
+        <span class="utab is-on"><i class="udot"></i>prod-web-01<span class="utab__x">✕</span></span>
+        <span class="utab"><i class="udot udot--ring"></i>staging-db<span class="utab__x">✕</span></span>
+        <span class="utab"><i class="udot"></i>bastion<span class="utab__pc">2</span><span class="utab__x">✕</span></span>
+        <span class="utab__plus">+</span>
+      </div>
+
+      <!-- the PTY body is the ONLY thing tinted by the terminal theme (nebula: #0c0e16) -->
+      <div class="upty">
+        <div><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span><span class="c-f">:~$</span> neofetch</div>
+        <div class="upty__row">
+          <pre class="upty__art">            .-/+oossssoo+/-.
+        `:+ssssssssssssssssss+:`
+      -+ssssssssssssssssssyyssss+-
+    .ossssssssssssssssssdMMMNysssso.
+   /sssssssssshdmmNNmmyNMMMMhssssss/
+  +sssssssshmydMMMMMMMNddddyssssssss+
+ /sssssssshNMMMyhhyyyyhmNMMMNhssssss/
+.ssssssssdMMMNhsssssssshNMMMdssssssss.
++sssshhhyNMMNyssssssssssyNMMMysssssss+
+ossyNMMMNyMMhssssssssssssshmmmhssssso
+ossyNMMMNyMMhsssssssssssssshmmmhssssso
++sssshhhyNMMNyssssssssssyNMMMysssssss+
+.ssssssssdMMMNhsssssssshNMMMdssssssss.
+ /sssssssshNMMMyhhyyyyhdNMMMNhssssss/
+  +sssssssssdmydMMMMMMMMddddyssssssss+
+   /sssssssssshdmNNNNmyNMMMMhssssss/
+    .ossssssssssssssssssdMMMNysssso.
+      -+sssssssssssssssssyyyssss+-
+        `:+ssssssssssssssssss+:`
+            .-/+oossssoo+/-.</pre>
+          <div class="upty__info">
+            <div><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span></div>
+            <div class="c-d">-----------------</div>
+            <div><span class="c-b">OS</span><span class="c-f">: Ubuntu 22.04.4 LTS x86_64</span></div>
+            <div><span class="c-b">Host</span><span class="c-f">: Ubuntu 22.04 LTS</span></div>
+            <div><span class="c-b">Kernel</span><span class="c-f">: 5.15.0-101-generic</span></div>
+            <div><span class="c-b">Uptime</span><span class="c-f">: 2 days, 4 hours, 12 mins</span></div>
+            <div><span class="c-b">Packages</span><span class="c-f">: 1184 (dpkg)</span></div>
+            <div><span class="c-b">Shell</span><span class="c-f">: bash 5.1.16</span></div>
+            <div><span class="c-b">Terminal</span><span class="c-f">: unissh</span></div>
+            <div><span class="c-b">CPU</span><span class="c-f">: Intel i7-10700K (16) @ 3.800GHz</span></div>
+            <div><span class="c-b">Memory</span><span class="c-f">: 2456MiB / 15902MiB</span></div>
+            <div class="upal"><i style="background:#333541"></i><i style="background:var(--uh-term-red)"></i><i style="background:var(--uh-term-green)"></i><i style="background:var(--uh-term-yellow)"></i><i style="background:var(--uh-term-blue)"></i><i style="background:var(--uh-term-purple)"></i><i style="background:var(--uh-term-cyan)"></i><i style="background:var(--uh-term-fg)"></i></div>
+            <div class="upal"><i style="background:var(--uh-term-dim)"></i><i style="background:#ff8299"></i><i style="background:#5cd8ae"></i><i style="background:#ffd583"></i><i style="background:#75a0ff"></i><i style="background:#c49dff"></i><i style="background:#79d1ff"></i><i style="background:#ffffff"></i></div>
+          </div>
+        </div>
+        <div class="upty__pr"><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span><span class="c-f">:~$</span> <span class="caret"></span></div>
+      </div>
+
+      <!-- ViewTerminal.tsx:1443-1530 — 30px status bar, desktop only -->
+      <div class="ustat">
+        <span class="ustat__s"><i class="udot"></i>connected</span>
+        <span class="ustat__h">ubuntu@10.0.0.12</span>
+        <span class="ustat__b"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
+        <span class="ustat__b"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></span>
+        <span class="ustat__sp"></span>
+        <span class="ustat__th">theme: UniSSH Nebula <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MOBILE (<1180px) — the real mobile shell ============ -->
+<div class="uapp uapp--phone" role="img" aria-label="A screenshot of the unissh mobile client on the Terminal screen: the vault switcher, three open sessions, a live shell, and the on-screen key row above the four bottom tabs.">
+  <!-- MobileApp.tsx:77-204 — top bar: vault pill + a single search button -->
+  <div class="mtop" aria-hidden="true">
+    <span class="mvault">
+      <span class="uavx">i</span>
+      <span class="uvault__t">
+        <span class="uvault__l1">infra</span>
+        <span class="uvault__l2">
+          <span class="ubadge"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.3A7 7 0 1 0 5 16h13a4 4 0 0 0 0-8z"/></svg>ops</span>
+          <span class="usync"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>Synced</span>
+        </span>
+      </span>
+      <svg class="uvault__cd" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+    </span>
+    <span class="mtop__sp"></span>
+    <span class="mtop__btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg></span>
+  </div>
+
+  <!-- MobileApp.tsx:375-435 — session switcher, only when >1 tab -->
+  <div class="msw" aria-hidden="true">
+    <span class="msw__i is-on"><i class="udot"></i>prod-web-01<span class="msw__x">✕</span></span>
+    <span class="msw__i"><i class="udot udot--ring"></i>staging-db<span class="msw__x">✕</span></span>
+    <span class="msw__i"><i class="udot"></i>bastion<span class="msw__x">✕</span></span>
+  </div>
+
+  <div class="upty upty--m" aria-hidden="true">
+    <div><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span><span class="c-f">:~$</span> uptime -p</div>
+    <div class="c-f">up 2 days, 4 hours, 12 minutes</div>
+    <div><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span><span class="c-f">:~$</span> systemctl is-active nginx</div>
+    <div class="c-gr">active</div>
+    <div class="upty__pr"><span class="c-g">ubuntu</span><span class="c-f">@</span><span class="c-p">prod-web-01</span><span class="c-f">:~$</span> <span class="caret"></span></div>
+  </div>
+
+  <!-- MobileApp.tsx:273-293 — KEY_SEQ, the 19 real keys, in order -->
+  <div class="mkeys" aria-hidden="true">
+    <span class="mkey">esc</span><span class="mkey">tab</span><span class="mkey">^C</span><span class="mkey">^D</span><span class="mkey">^Z</span><span class="mkey">^L</span><span class="mkey">^R</span><span class="mkey">^A</span><span class="mkey">^E</span><span class="mkey">^W</span><span class="mkey">^U</span><span class="mkey">|</span><span class="mkey">~</span><span class="mkey">/</span><span class="mkey">-</span><span class="mkey">←</span><span class="mkey">↓</span><span class="mkey">↑</span><span class="mkey">→</span>
+  </div>
+
+  <!-- MobileApp.tsx:679-763 — 4 tabs, active = ink label + 2px accent tick -->
+  <div class="mtabs" aria-hidden="true">
+    <span class="mtab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg>Hosts</span>
+    <span class="mtab is-on"><i class="mtab__tick"></i><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-5-6-5M12 19h8"/></svg>Terminal</span>
+    <span class="mtab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>Run</span>
+    <span class="mtab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>More</span>
+  </div>
+</div>
+
+<style>
+/* ============================================================
+   REAL CLIENT — tokens.ts NEBULA dark (DARK base + ACCENTS.blue)
+   ============================================================ */
+/* Palette comes from theme.css (--uh-*). This component used to carry its
+   own copy of the whole nebula palette plus the terminal theme, which meant
+   syncing tokens.ts touched theme.css and changed nothing here. One source. */
+.uapp{
+  border:1px solid var(--uh-line); border-radius:13px; overflow:hidden;
+  background:var(--uh-bg0); color:var(--uh-txt);
+  box-shadow:0 50px 120px -40px rgba(0,0,0,.95);
+  text-align:left;
+}
+.uapp--desk{ display:none; }
+.uapp--phone{ display:flex; flex-direction:column; max-width:400px; margin-inline:auto; }
+@media (min-width:1180px){
+  .uapp--desk{ display:block; }
+  .uapp--phone{ display:none; }
+}
+.uapp .i{ flex:none; }
+
+/* native macOS titlebar (tauri decorations:true — the OS draws the lights) */
+.uapp__native{ height:30px; display:flex; align-items:center; padding:0 12px; background:var(--uh-bg1); }
+.lights{ display:flex; gap:7px; }
+.lights i{ width:11px; height:11px; border-radius:50%; display:block; }
+
+/* App.tsx:352-406 — 44px in-app toolbar */
+.uapp__bar{
+  height:44px; display:flex; align-items:center; gap:14px; padding:0 16px;
+  background:var(--uh-bg1); border-top:1px solid var(--uh-line); border-bottom:1px solid var(--uh-line);
+}
+.ulogo{ display:inline-flex; align-items:center; gap:9px; margin-left:4px; flex:none; }
+.ulogo__mark{
+  width:18px; height:18px; border-radius:5px; background:var(--uh-accent);
+  display:grid; place-items:center; font-family:var(--uh-font-mono); font-size:9px; font-weight:700;
+  color:#fff; font-style:normal; letter-spacing:-.05em;
+}
+.ulogo__wm{ font-size:13.3px; font-weight:700; letter-spacing:-0.3px; }
+.ulogo__wm em{ font-style:normal; color:var(--uh-accent); }
+.uapp__barmid{ flex:1; display:flex; justify-content:center; min-width:0; }
+/* was width:380px;max-width:40% with nowrap: intrinsic content (284px) never
+   fit the capped box (247px), so the ⌘K badge was pushed past the clip at
+   every width and never rendered once. Let it shrink, truncate the
+   placeholder, and keep the badge unshrinkable. */
+.usearch{
+  display:inline-flex; align-items:center; gap:8px; flex:1; min-width:0; max-width:380px;
+  height:30px; padding:0 12px; border-radius:8px; background:var(--uh-bg2);
+  border:1px solid var(--uh-line); color:var(--uh-txt3); font-size:13px;
+}
+.usearch__t{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.usearch__kbd{
+  margin-left:auto; flex:none; font-family:var(--uh-font-mono); font-size:11px; padding:1px 6px;
+  border-radius:6px; background:var(--uh-bg3); border:1px solid var(--uh-line);
+}
+.uapp__barright{ display:flex; align-items:center; gap:8px; flex:none; }
+.utib{ width:30px; height:30px; border-radius:8px; display:grid; place-items:center; color:var(--uh-txt2); }
+.uav{
+  width:30px; height:30px; border-radius:50%; display:grid; place-items:center;
+  background:var(--uh-bg3); border:1px solid var(--uh-line); color:var(--uh-txt2);
+  font-size:13px; font-weight:700;
+}
+.uapp__body{ display:grid; grid-template-columns:220px minmax(0,1fr); min-width:0; }
+
+/* Shell.tsx:760-899 — sidebar */
+.unav{
+  background:var(--uh-bg0); border-right:1px solid var(--uh-line);
+  padding:12px 0; display:flex; flex-direction:column; min-height:430px;
+}
+.unav__grp{
+  display:flex; align-items:center; padding:12px 12px 5px 18px;
+  font-size:11px; font-weight:700; letter-spacing:.6px; color:var(--uh-txt3); text-transform:uppercase;
+}
+.unav__ga{
+  margin-left:auto; width:22px; height:22px; border-radius:6px; display:grid; place-items:center;
+  border:1px solid var(--uh-line); background:var(--uh-bg1); color:var(--uh-txt3);
+}
+/* Shell.tsx:271-333 — full-bleed row, no pill, active tick is inset 2.5px */
+.uni{
+  height:32px; display:flex; align-items:center; gap:8px; padding:0 18px;
+  font-size:13px; font-weight:500; color:var(--uh-txt2); border-radius:0;
+}
+.uni--sub{ padding:0 18px 0 30px; }
+.uni.is-on{ background:var(--uh-bg2); color:var(--uh-txt); font-weight:600; box-shadow:inset 2.5px 0 0 var(--uh-accent); }
+.uni .i{ width:15px; height:15px; color:var(--uh-txt3); }
+.uni.is-on .i{ color:var(--uh-txt); }
+.uni__l{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.uni__c{ margin-left:auto; font-family:var(--uh-font-mono); font-size:11px; font-weight:600; color:var(--uh-txt3); }
+.uni__dot{ width:6px; height:6px; border-radius:50%; background:var(--uh-green); flex:none; margin-left:auto; }
+.uni__dot + .uni__c{ margin-left:0; }
+.unav__sp{ flex:1; }
+.unav__foot{ margin-top:8px; border-top:1px solid var(--uh-line); padding:10px 12px 0; }
+
+/* Shell.tsx:429-506 — vault switcher (SyncBadge lives here) */
+.uvault{
+  width:100%; display:flex; align-items:center; gap:9px; padding:10px;
+  border-radius:10px; background:var(--uh-bg1); border:1px solid var(--uh-line); overflow:hidden;
+}
+.uavx{
+  width:26px; height:26px; border-radius:7px; display:grid; place-items:center; flex:none;
+  background:var(--uh-bg3); border:1px solid var(--uh-line); color:var(--uh-txt2);
+  font-size:11px; font-weight:700; text-transform:uppercase;
+}
+.uvault__t{ min-width:0; flex:1; }
+.uvault__l1{ display:flex; align-items:center; gap:5px; font-size:13px; font-weight:700; color:var(--uh-txt); }
+.uvault__l2{ display:flex; align-items:center; gap:6px; margin-top:2px; font-size:11px; color:var(--uh-txt3); }
+.ubadge{ display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:var(--uh-txt3); }
+.usync{ display:inline-flex; align-items:center; gap:4px; font-size:11px; font-weight:600; color:var(--uh-green); }
+.uvault__cd{ color:var(--uh-txt3); flex:none; }
+
+/* ViewTerminal.tsx — column */
+.uterm{ display:flex; flex-direction:column; background:var(--uh-bg0); min-width:0; }
+/* TermTabStrip.tsx:36-345 */
+.utabs{ min-height:38px; display:flex; align-items:stretch; background:var(--uh-bg0); border-bottom:1px solid var(--uh-line); }
+.utab{
+  display:inline-flex; align-items:center; gap:8px; padding:0 12px; max-width:220px;
+  font-family:var(--uh-font-mono); font-size:13px; color:var(--uh-txt3);
+  border-right:1px solid var(--uh-line); border-bottom:2px solid transparent; overflow:hidden;
+}
+.utab.is-on{ background:var(--uh-bg0); color:var(--uh-txt); border-bottom-color:var(--uh-accent); }
+.udot{ width:7px; height:7px; border-radius:50%; background:var(--uh-green); flex:none; box-sizing:border-box; }
+.udot--ring{ background:transparent; border:1.5px solid var(--uh-amber); }
+.utab__x{ font-size:11px; opacity:.6; }
+.utab__pc{ font-size:11px; font-weight:700; padding:2px 4px; border-radius:6px; color:var(--uh-txt3); background:var(--uh-bg2); }
+.utab__plus{ width:38px; display:grid; place-items:center; color:var(--uh-txt3); font-size:15px; }
+
+/* the PTY body — the ONLY surface the terminal theme paints */
+.upty{ flex:1; padding:14px 16px; background:var(--uh-term-bg); font-family:var(--uh-font-mono); font-size:13.5px; line-height:1.6; color:var(--uh-term-fg); min-width:0; }
+.upty--m{ font-size:14.5px; padding:14px 14px 16px; }
+.c-g{ color:var(--uh-term-green); } .c-p{ color:var(--uh-term-purple); } .c-b{ color:var(--uh-term-blue); }
+.c-f{ color:var(--uh-term-fg); } .c-d{ color:var(--uh-term-dim); } .c-gr{ color:var(--uh-term-green); }
+.upty__row{ display:flex; gap:18px; margin-top:8px; }
+.upty__art{ color:var(--uh-term-red); font-size:8.5px; line-height:1.15; white-space:pre; flex:none; margin:0; }
+.upty__info{ min-width:0; }
+.upty__pr{ margin-top:12px; }
+.upal{ display:flex; margin-top:9px; }
+.upal i{ width:19px; height:11px; display:block; }
+.caret{
+  display:inline-block; width:6px; height:13px; background:var(--uh-term-fg);
+  vertical-align:-2px; animation:caret-blink 1.1s step-end infinite;
+}
+/* This lived in the prototype page's <style> and did not travel with the
+   markup, so the caret sat still. Keep it next to its only consumer.
+   Reduced motion is handled globally in theme.css. */
+@keyframes caret-blink{ 50%{ opacity:0; } }
+
+/* ViewTerminal.tsx:1443-1530 — 30px status bar */
+.ustat{
+  height:30px; flex:none; display:flex; align-items:center; gap:10px; padding:0 14px;
+  background:var(--uh-bg0); border-top:1px solid var(--uh-line);
+  font-family:var(--uh-font-mono); font-size:12px; color:var(--uh-txt3);
+}
+.ustat__s{ display:inline-flex; align-items:center; gap:6px; color:var(--uh-green); font-weight:600; }
+.ustat__h{ color:var(--uh-txt2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ustat__b{ width:22px; height:22px; border-radius:6px; display:grid; place-items:center; color:var(--uh-txt3); flex:none; }
+.ustat__sp{ flex:1; }
+.ustat__th{ display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
+
+/* ============ mobile shell ============ */
+/* MobileApp.tsx:77-204 — top bar */
+.mtop{ display:flex; align-items:center; padding:4px 16px 12px; background:var(--uh-bg0); }
+.mvault{
+  display:flex; align-items:center; gap:9px; min-height:44px; max-width:66%;
+  padding:0 12px 0 7px; border-radius:12px; background:var(--uh-bg2); border:1px solid var(--uh-line2);
+}
+.mvault .uvault__l1{ font-size:14px; }
+.mtop__sp{ flex:1; }
+.mtop__btn{ width:44px; height:44px; display:grid; place-items:center; color:var(--uh-txt2); flex:none; }
+/* MobileApp.tsx:375-435 — session switcher */
+/* clip, not auto: Chromium makes scroll containers focusable, so these took
+   Tab while announcing nothing (they are aria-hidden inside a role="img").
+   A picture of an app does not scroll. */
+.msw{
+  display:flex; gap:6px; padding:8px 12px; overflow-x:clip; background:var(--uh-bg1);
+  border-bottom:1px solid var(--uh-line); scrollbar-width:none;
+}
+.msw::-webkit-scrollbar{ display:none; }
+.msw__i{
+  display:inline-flex; align-items:center; gap:8px; min-height:44px; padding:6px 4px 6px 10px;
+  font-family:var(--uh-font-mono); font-size:13px; color:var(--uh-txt3);
+  border-bottom:2px solid transparent; white-space:nowrap; flex:none;
+}
+.msw__i.is-on{ color:var(--uh-txt); border-bottom-color:var(--uh-txt2); }
+.msw__x{ width:32px; text-align:center; font-size:11px; opacity:.6; }
+/* MobileApp.tsx:447-472 — key accessory row */
+.mkeys{
+  display:flex; gap:6px; padding:10px 12px; overflow-x:clip; background:var(--uh-bg1);
+  border-top:1px solid var(--uh-line); scrollbar-width:none; overscroll-behavior:contain;
+}
+.mkeys::-webkit-scrollbar{ display:none; }
+.mkey{
+  min-width:44px; height:44px; display:grid; place-items:center; padding:0 10px; flex:none;
+  border-radius:8px; background:var(--uh-bg3); border:1px solid var(--uh-line);
+  font-family:var(--uh-font-mono); font-size:13px; color:var(--uh-txt2);
+}
+/* MobileApp.tsx:679-763 — bottom tab bar */
+.mtabs{ display:flex; padding:8px; background:var(--uh-bg1); border-top:1px solid var(--uh-line); }
+.mtab{
+  position:relative; flex:1; min-height:44px; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:3px; padding:4px 2px;
+  font-size:11px; font-weight:500; color:var(--uh-txt3);
+}
+.mtab svg{ width:23px; height:23px; }
+.mtab.is-on{ color:var(--uh-txt); font-weight:700; }
+.mtab__tick{
+  position:absolute; top:-8px; left:6px; right:6px; height:2px;
+  background:var(--uh-accent); border-radius:2px;
+}
+</style>
